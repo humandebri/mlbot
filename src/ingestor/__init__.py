@@ -1,0 +1,1 @@
+"""WebSocket data ingestor for Bybit market data."""

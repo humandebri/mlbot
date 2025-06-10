@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlbot-config
+  namespace: mlbot
+  labels:
+    app.kubernetes.io/name: bybit-liquidation-bot
+    app.kubernetes.io/component: config
+data:
+  ENVIRONMENT: "production"
+  DEBUG: "false"
+  REDIS__HOST: "redis-service"
+  REDIS__PORT: "6379"
+  REDIS__DB: "0"
+  DUCKDB__MEMORY_LIMIT: "2GB"
+  DUCKDB__THREADS: "4"
+  TRADING__MAX_POSITION_PCT: "0.10"
+  TRADING__MAX_DRAWDOWN_PCT: "0.05"
+  TRADING__EMERGENCY_STOP_PCT: "0.10"
+  TRADING__MIN_EXPECTED_PNL: "0.0"
+  TRADING__MIN_FILL_PROBABILITY: "0.3"
+  TRADING__MAX_OPEN_POSITIONS: "5"
+  LOGGING__LEVEL: "INFO"
+  LOGGING__USE_JSON: "true"
+  MONITORING__PROMETHEUS_PORT: "9090"
+  MONITORING__HEALTH_CHECK_PORT: "8080"
+  MONITORING__COLLECT_SYSTEM_METRICS: "true"
+  MONITORING__METRICS_INTERVAL: "10"

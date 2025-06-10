@@ -1,0 +1,159 @@
+[tool.poetry]
+name = "bybit-liquidation-bot"
+version = "0.1.0"
+description = "Bybit liquidation-driven ML trading bot"
+authors = ["ML Bot Team <team@mlbot.ai>"]
+readme = "README.md"
+packages = [{include = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.13"
+fastapi = "^0.115.0"
+uvicorn = {extras = ["standard"], version = "^0.32.0"}
+websockets = "^13.1"
+aiohttp = "^3.10.0"
+redis = "^5.2.0"
+duckdb = "^1.1.0"
+pandas = "^2.2.0"
+numpy = "^2.1.0"
+catboost = "^1.2.7"
+onnxruntime = "^1.20.0"
+pydantic = "^2.10.0"
+pydantic-settings = "^2.6.0"
+httpx = "^0.28.0"
+structlog = "^24.4.0"
+prometheus-client = "^0.21.0"
+asyncio-mqtt = "^0.16.0"
+python-multipart = "^0.0.17"
+pyarrow = "^18.0.0"
+orjson = "^3.10.0"
+psutil = "^6.1.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+pytest-asyncio = "^0.24.0"
+pytest-cov = "^6.0.0"
+black = "^24.10.0"
+ruff = "^0.8.0"
+mypy = "^1.13.0"
+pre-commit = "^4.0.0"
+jupyter = "^1.1.0"
+ipykernel = "^6.29.0"
+
+[tool.poetry.group.ml.dependencies]
+scikit-learn = "^1.5.0"
+optuna = "^4.1.0"
+shap = "^0.46.0"
+plotly = "^5.24.0"
+seaborn = "^0.13.0"
+matplotlib = "^3.9.0"
+
+[tool.poetry.group.cloud.dependencies]
+kubernetes = "^31.0.0"
+boto3 = "^1.35.0"
+google-cloud-storage = "^2.18.0"
+azure-storage-blob = "^12.23.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py313']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.eggs
+  | \.git
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+select = [
+    "E",  # pycodestyle errors
+    "F",  # pyflakes
+    "W",  # pycodestyle warnings
+    "C90", # mccabe
+    "I",  # isort
+    "N",  # pep8-naming
+    "UP", # pyupgrade
+    "S",  # bandit
+    "B",  # flake8-bugbear
+    "A",  # flake8-builtins
+    "C4", # flake8-comprehensions
+    "T20", # flake8-print
+]
+ignore = [
+    "S101", # assert statements
+    "S608", # possible SQL injection
+]
+
+[tool.ruff.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+namespace_packages = true
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = [
+    "catboost.*",
+    "duckdb.*",
+    "redis.*",
+    "prometheus_client.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = [
+    "tests",
+]
+asyncio_mode = "auto"
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "e2e: End-to-end tests",
+    "slow: Slow running tests",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+]
+
+[tool.poetry.scripts]
+bot = "src.main:main"
+ingestor = "src.ingestor.main:main"
+feature-hub = "src.feature_hub.main:main"
+model-server = "src.model_server.main:main"
+order-router = "src.order_router.main:main"

@@ -1,0 +1,504 @@
+"""Bybit WebSocket and REST API client with optimized performance."""
+
+import asyncio
+import json
+import time
+from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set
+from urllib.parse import urljoin
+
+import aiohttp
+import websockets
+from websockets.exceptions import ConnectionClosed, InvalidURI
+
+from .config import settings
+from .logging import get_logger
+from .monitoring import (
+    ERRORS_TOTAL,
+    MESSAGES_RECEIVED,
+    WEBSOCKET_CONNECTIONS,
+    WEBSOCKET_RECONNECTS,
+    increment_counter,
+    set_gauge,
+)
+
+logger = get_logger(__name__)
+
+
+class BybitWebSocketClient:
+    """
+    High-performance Bybit WebSocket client with automatic reconnection.
+    
+    Optimized for:
+    - Low latency data processing
+    - Efficient memory usage
+    - Automatic error recovery
+    - Rate limit compliance
+    """
+    
+    def __init__(
+        self,
+        symbols: List[str],
+        on_message: Callable[[str, Dict[str, Any]], None],
+        testnet: bool = True,
+    ):
+        self.symbols = symbols
+        self.on_message = on_message
+        self.testnet = testnet
+        
+        # Connection management
+        self.websocket: Optional[websockets.WebSocketServerProtocol] = None
+        self.running = False
+        self.reconnect_count = 0
+        self.last_ping = 0.0
+        
+        # Subscription tracking
+        self.subscribed_topics: Set[str] = set()
+        self.subscription_queue: List[Dict[str, Any]] = []
+        
+        # Performance optimization
+        self.message_buffer: List[Dict[str, Any]] = []
+        self.buffer_size = 100
+        self.flush_interval = 0.1  # 100ms
+        
+        # URLs
+        self.ws_url = (
+            settings.bybit.testnet_ws_url if testnet 
+            else settings.bybit.ws_url
+        )
+    
+    async def start(self) -> None:
+        """Start the WebSocket connection with retry logic."""
+        self.running = True
+        logger.info(
+            "Starting Bybit WebSocket client",
+            symbols=self.symbols,
+            testnet=self.testnet,
+            url=self.ws_url
+        )
+        
+        while self.running:
+            try:
+                await self._connect_and_run()
+            except Exception as e:
+                logger.error("WebSocket connection failed", exception=e)
+                increment_counter(ERRORS_TOTAL, component="websocket", error_type=type(e).__name__)
+                
+                if self.running:
+                    self.reconnect_count += 1
+                    increment_counter(WEBSOCKET_RECONNECTS, symbol="all")
+                    
+                    if self.reconnect_count > settings.bybit.max_reconnect_attempts:
+                        logger.error("Max reconnect attempts reached, stopping")
+                        break
+                    
+                    wait_time = min(settings.bybit.reconnect_delay * self.reconnect_count, 60)
+                    logger.info(f"Reconnecting in {wait_time}s (attempt {self.reconnect_count})")
+                    await asyncio.sleep(wait_time)
+    
+    async def stop(self) -> None:
+        """Stop the WebSocket connection gracefully."""
+        logger.info("Stopping Bybit WebSocket client")
+        self.running = False
+        
+        if self.websocket:
+            await self.websocket.close()
+            self.websocket = None
+        
+        # Update metrics
+        for symbol in self.symbols:
+            set_gauge(WEBSOCKET_CONNECTIONS, 0, symbol=symbol)
+    
+    async def _connect_and_run(self) -> None:
+        """Establish connection and run message processing loop."""
+        try:
+            # Connect with optimized settings
+            self.websocket = await asyncio.wait_for(
+                websockets.connect(
+                    self.ws_url,
+                    ping_interval=settings.bybit.ping_interval,
+                    ping_timeout=30,
+                    max_size=1024 * 1024 * 10,  # 10MB max message size
+                    compression=None,  # Disable compression for speed
+                    close_timeout=10,
+                    open_timeout=30,
+                ),
+                timeout=60  # 60 second connection timeout
+            )
+            
+            logger.info("WebSocket connected successfully")
+            self.reconnect_count = 0
+            
+            # Update connection metrics
+            for symbol in self.symbols:
+                set_gauge(WEBSOCKET_CONNECTIONS, 1, symbol=symbol)
+            
+            # Subscribe to feeds
+            await self._subscribe_to_feeds()
+            
+            # Start message processing tasks
+            tasks = [
+                asyncio.create_task(self._message_receiver()),
+                asyncio.create_task(self._ping_sender()),
+                asyncio.create_task(self._buffer_flusher()),
+            ]
+            
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+        
+        except (ConnectionClosed, InvalidURI) as e:
+            logger.warning(f"WebSocket connection error: {e}")
+            raise
+        except Exception as e:
+            logger.error("Unexpected error in WebSocket connection", exception=e)
+            raise
+    
+    async def _subscribe_to_feeds(self) -> None:
+        """Subscribe to all required data feeds efficiently."""
+        # Build subscription requests
+        subscriptions = []
+        
+        for symbol in self.symbols:
+            # High-frequency feeds
+            subscriptions.extend([
+                f"kline.1s.{symbol}",      # 1-second klines
+                f"orderbook.25.{symbol}",  # 25-level orderbook
+                f"trades.{symbol}",        # Real-time trades
+            ])
+            
+            # Liquidation feeds (critical for our strategy)
+            subscriptions.append(f"allLiquidation.{symbol}")
+        
+        # Send subscription in batches to respect rate limits
+        batch_size = 10
+        for i in range(0, len(subscriptions), batch_size):
+            batch = subscriptions[i:i + batch_size]
+            
+            subscription_msg = {
+                "op": "subscribe",
+                "args": batch
+            }
+            
+            await self.websocket.send(json.dumps(subscription_msg))
+            logger.info(f"Subscribed to feeds", topics=batch)
+            
+            # Small delay between batches to avoid rate limiting
+            if i + batch_size < len(subscriptions):
+                await asyncio.sleep(0.1)
+        
+        self.subscribed_topics.update(subscriptions)
+    
+    async def _message_receiver(self) -> None:
+        """Receive and buffer messages for efficient processing."""
+        try:
+            async for message in self.websocket:
+                try:
+                    data = json.loads(message)
+                    await self._process_message(data)
+                    
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Invalid JSON received: {e}")
+                    increment_counter(ERRORS_TOTAL, component="websocket", error_type="json_decode")
+                
+                except Exception as e:
+                    logger.error("Error processing message", exception=e, message=message[:200])
+                    increment_counter(ERRORS_TOTAL, component="websocket", error_type="message_processing")
+        
+        except ConnectionClosed:
+            logger.warning("WebSocket connection closed")
+            raise
+        except Exception as e:
+            logger.error("Error in message receiver", exception=e)
+            raise
+    
+    async def _process_message(self, data: Dict[str, Any]) -> None:
+        """Process incoming WebSocket message efficiently."""
+        # Handle system messages
+        if "op" in data:
+            if data["op"] == "pong":
+                return
+            elif data["op"] == "subscribe":
+                logger.debug("Subscription confirmed", topics=data.get("args", []))
+                return
+        
+        # Handle data messages
+        topic = data.get("topic", "")
+        if not topic:
+            return
+        
+        # Extract symbol from topic
+        symbol = self._extract_symbol_from_topic(topic)
+        if not symbol:
+            return
+        
+        # Buffer message for batch processing
+        self.message_buffer.append({
+            "topic": topic,
+            "symbol": symbol,
+            "data": data,
+            "timestamp": time.time()
+        })
+        
+        # Increment metrics
+        increment_counter(MESSAGES_RECEIVED, source="websocket", symbol=symbol)
+        
+        # Flush buffer if it's getting full
+        if len(self.message_buffer) >= self.buffer_size:
+            await self._flush_buffer()
+    
+    async def _buffer_flusher(self) -> None:
+        """Periodically flush message buffer for consistent latency."""
+        while self.running:
+            await asyncio.sleep(self.flush_interval)
+            if self.message_buffer:
+                await self._flush_buffer()
+    
+    async def _flush_buffer(self) -> None:
+        """Flush buffered messages to the message handler."""
+        if not self.message_buffer:
+            return
+        
+        # Process all buffered messages
+        buffer_copy = self.message_buffer.copy()
+        self.message_buffer.clear()
+        
+        for msg in buffer_copy:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, self.on_message, msg["topic"], msg["data"]
+                )
+            except Exception as e:
+                logger.error("Error in message callback", exception=e)
+                increment_counter(ERRORS_TOTAL, component="callback", error_type=type(e).__name__)
+    
+    async def _ping_sender(self) -> None:
+        """Send periodic ping messages to keep connection alive."""
+        while self.running:
+            try:
+                await asyncio.sleep(settings.bybit.ping_interval)
+                
+                if self.websocket and not self.websocket.closed:
+                    ping_msg = {"op": "ping"}
+                    await self.websocket.send(json.dumps(ping_msg))
+                    self.last_ping = time.time()
+            
+            except Exception as e:
+                logger.error("Error sending ping", exception=e)
+                break
+    
+    def _extract_symbol_from_topic(self, topic: str) -> Optional[str]:
+        """Extract symbol from topic string efficiently."""
+        try:
+            # Topic formats:
+            # kline.1s.BTCUSDT
+            # orderbook.25.BTCUSDT
+            # trades.BTCUSDT
+            # allLiquidation.BTCUSDT
+            parts = topic.split(".")
+            if len(parts) >= 2:
+                symbol = parts[-1]  # Last part is always symbol
+                return symbol if symbol in self.symbols else None
+        except Exception:
+            pass
+        return None
+
+
+class BybitRESTClient:
+    """
+    Efficient Bybit REST API client with rate limiting and caching.
+    
+    Optimized for:
+    - Rate limit compliance
+    - Request caching
+    - Automatic retries
+    - Cost-effective API usage
+    """
+    
+    def __init__(self, testnet: bool = True):
+        self.testnet = testnet
+        self.base_url = (
+            settings.bybit.testnet_url if testnet 
+            else settings.bybit.base_url
+        )
+        
+        # Rate limiting
+        self.request_semaphore = asyncio.Semaphore(settings.bybit.requests_per_second)
+        self.request_times: List[float] = []
+        
+        # Caching for expensive calls
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.cache_ttl = 60  # 60 seconds cache TTL
+        
+        # Session management
+        self.session: Optional[aiohttp.ClientSession] = None
+    
+    async def __aenter__(self):
+        """Async context manager entry."""
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            connector=aiohttp.TCPConnector(
+                limit=20,  # Connection pool limit
+                limit_per_host=10,
+                keepalive_timeout=60,
+            )
+        )
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        if self.session:
+            await self.session.close()
+    
+    async def get_open_interest(self, symbols: List[str]) -> Dict[str, float]:
+        """Get open interest data with caching."""
+        cache_key = f"oi:{','.join(sorted(symbols))}"
+        
+        # Check cache first
+        if self._is_cache_valid(cache_key):
+            return self.cache[cache_key]["data"]
+        
+        try:
+            oi_data = {}
+            
+            for symbol in symbols:
+                async with self.request_semaphore:
+                    await self._wait_for_rate_limit()
+                    
+                    url = urljoin(self.base_url, "/v5/market/open-interest")
+                    params = {
+                        "category": "linear",
+                        "symbol": symbol,
+                        "intervalTime": "1h"
+                    }
+                    
+                    async with self.session.get(url, params=params) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if data.get("retCode") == 0:
+                                result = data.get("result", {})
+                                oi_list = result.get("list", [])
+                                if oi_list:
+                                    oi_data[symbol] = float(oi_list[0].get("openInterest", 0))
+                            else:
+                                logger.warning(f"API error for {symbol}: {data.get('retMsg')}")
+                        else:
+                            logger.warning(f"HTTP error {response.status} for {symbol}")
+            
+            # Cache the result
+            self.cache[cache_key] = {
+                "data": oi_data,
+                "timestamp": time.time()
+            }
+            
+            return oi_data
+        
+        except Exception as e:
+            logger.error("Error fetching open interest", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+            return {}
+    
+    async def get_funding_rate(self, symbols: List[str]) -> Dict[str, float]:
+        """Get funding rate data with caching."""
+        cache_key = f"funding:{','.join(sorted(symbols))}"
+        
+        # Check cache first
+        if self._is_cache_valid(cache_key):
+            return self.cache[cache_key]["data"]
+        
+        try:
+            funding_data = {}
+            
+            for symbol in symbols:
+                async with self.request_semaphore:
+                    await self._wait_for_rate_limit()
+                    
+                    url = urljoin(self.base_url, "/v5/market/funding/history")
+                    params = {
+                        "category": "linear",
+                        "symbol": symbol,
+                        "limit": 1
+                    }
+                    
+                    async with self.session.get(url, params=params) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if data.get("retCode") == 0:
+                                result = data.get("result", {})
+                                funding_list = result.get("list", [])
+                                if funding_list:
+                                    funding_data[symbol] = float(funding_list[0].get("fundingRate", 0))
+                            else:
+                                logger.warning(f"API error for {symbol}: {data.get('retMsg')}")
+                        else:
+                            logger.warning(f"HTTP error {response.status} for {symbol}")
+            
+            # Cache the result
+            self.cache[cache_key] = {
+                "data": funding_data,
+                "timestamp": time.time()
+            }
+            
+            return funding_data
+        
+        except Exception as e:
+            logger.error("Error fetching funding rate", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+            return {}
+    
+    def _is_cache_valid(self, key: str) -> bool:
+        """Check if cached data is still valid."""
+        if key not in self.cache:
+            return False
+        
+        entry = self.cache[key]
+        return (time.time() - entry["timestamp"]) < self.cache_ttl
+    
+    async def _wait_for_rate_limit(self) -> None:
+        """Ensure we don't exceed rate limits."""
+        now = time.time()
+        
+        # Clean old request times
+        self.request_times = [t for t in self.request_times if now - t < 60]
+        
+        # Check if we need to wait
+        if len(self.request_times) >= settings.bybit.requests_per_minute:
+            oldest_time = min(self.request_times)
+            wait_time = 60 - (now - oldest_time) + 0.1  # Small buffer
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+        
+        self.request_times.append(now)
+
+
+@asynccontextmanager
+async def get_bybit_clients(
+    symbols: List[str],
+    on_message: Callable[[str, Dict[str, Any]], None],
+    testnet: bool = True
+) -> AsyncGenerator[tuple[BybitWebSocketClient, BybitRESTClient], None]:
+    """Context manager for Bybit clients."""
+    ws_client = BybitWebSocketClient(symbols, on_message, testnet)
+    
+    async with BybitRESTClient(testnet) as rest_client:
+        try:
+            # Start WebSocket client
+            ws_task = asyncio.create_task(ws_client.start())
+            
+            yield ws_client, rest_client
+            
+        finally:
+            # Cleanup
+            await ws_client.stop()
+            if not ws_task.done():
+                ws_task.cancel()
+                try:
+                    await ws_task
+                except asyncio.CancelledError:
+                    pass

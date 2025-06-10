@@ -1,0 +1,39 @@
+# Core dependencies
+pydantic>=2.0.0
+redis>=5.0.0
+duckdb>=0.9.0
+aiohttp>=3.9.0
+websockets>=12.0
+numpy>=1.24.0
+
+# Monitoring and metrics
+prometheus-client>=0.19.0
+psutil>=5.9.0
+
+# Development and testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# Data processing
+pandas>=2.0.0
+pyarrow>=14.0.0
+
+# ML and Model Server
+scikit-learn>=1.3.0
+onnx>=1.15.0
+onnxruntime>=1.16.0
+catboost>=1.2.0
+optuna>=3.4.0
+scipy>=1.11.0
+
+# FastAPI and Model Server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+httptools>=0.6.0
+uvloop>=0.19.0
+
+# Optional: for enhanced logging
+structlog>=23.0.0
+
+# Monitoring dashboard
+rich>=13.0.0

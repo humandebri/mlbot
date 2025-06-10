@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mlbot
+  labels:
+    name: mlbot
+    app.kubernetes.io/name: bybit-liquidation-bot
+    app.kubernetes.io/component: namespace

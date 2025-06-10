@@ -1,0 +1,235 @@
+Bybit Wick‑Hunting Bot — ML‑Driven Design
+
+Goal:  Place limit orders at dynamic offsets (δ) below market price when the expected net return E[ret | x, δ,T] – fee is positive.  Offsets (δ) and look‑ahead horizons (T) are selected online from data such as liquidation spikes.
+
+0. Quick Spec
+
+Symbol
+
+Description
+
+δ
+
+Price offset as a % of mid‑price (e.g. 10 %)
+
+T
+
+Look‑ahead window to decide fill (s) – default 300 s
+
+H
+
+Hold time after fill before exit (s) – same as T unless stated
+
+expPNL
+
+E[ret] × P[fill] − fee (target label)
+
+1. System Architecture
+
+Bybit WS ➜ Ingestor ➜ FeatureHub ➜ Model‑Server ➜ Order‑Router ➜ Bybit Private REST
+                              ▲         ▼
+                      DuckDB / Parquet   Redis Streams (pub/sub)
+
+Ingestor – subscribes to orderbook.25, kline.1s/1m, trades, allLiquidation.*, OI & funding; stores raw Parquet hourly.
+
+FeatureHub – builds per‑second features; publishes latest row to redis:features:<symbol>:latest.
+
+Model‑Server – ONNX Runtime (CatBoost model) predicts expPNL and P(fill) for candidate (δ,T) pairs (<1 ms).
+
+Order‑Router – fires IOC/GTC orders via /v5/order/create when thresholds met; monitors fills via private WS.
+
+Retraining & HPO – weekly Airflow job ⇒ Optuna ⇒ model replacement behind feature flag.
+
+2. Data Sources & Storage
+
+Feed
+
+Endpoint
+
+Cadence
+
+Usage
+
+kline
+
+v5.public.kline.1s/1m (WS)
+
+1 s / 60 s
+
+OHLCV & mid‑price
+
+Orderbook
+
+v5.public.orderbook.25 (WS)
+
+tick
+
+spread, depth ratios
+
+Trades
+
+v5.public.trades (WS)
+
+tick
+
+realised vol, aggressor flow
+
+Liquidations
+
+allLiquidation.* (WS)
+
+~500 ms
+
+spike indicators
+
+Open Interest
+
+open-interest (REST)
+
+1 h
+
+macro bias
+
+Funding
+
+funding-rate (REST)
+
+1 h
+
+event flags
+
+Raw ticks → Parquet (+DuckDB) for back‑test & offline labelling.
+
+3. Feature Engineering
+
+3.1 Micro‑Liquidity
+
+spread = ask – bid
+
+depth_ratio_1 = Σbid₁₋₅ / Σask₁₋₅
+
+liq_vol_5s, liq_side_ratio, liq_spike_z
+
+3.2 Volatility & Momentum
+
+ATR₁ₘ, return_30s, VWAP deviation, OBV slope
+
+3.3 Time Context
+
+Second‑of‑minute, minute‑of‑hour, funding window flag, CPI/FOMC flag
+
+3.4 External Macro (optional)
+
+BTC.D, DXY, VIX; cached via external REST every 5 m
+
+4. Label Generation (Offline)
+
+# df: 1‑sec OHLCV DataFrame indexed by timestamp
+
+def make_labels(df, delta=0.10, lookahead=300, hold=300):
+    entry      = df.close.shift(1) * (1 - delta)
+    future_low = df.low.rolling(lookahead, 1).min().shift(-lookahead+1)
+    fill       = (future_low <= entry).astype(int)
+    exit_price = df.close.shift(-lookahead - hold + 1)
+    ret        = (exit_price - entry) / entry
+    return pd.DataFrame({
+        'fill': fill,
+        'ret':  ret,
+        'expPNL': ret * fill - FEE_CONST
+    })
+
+Repeat for a grid of δ ∈ {2, 5, 10 %} × T ∈ {60, 300, 900 s}.
+
+5. Modelling Strategy
+
+Aspect
+
+Choice
+
+Learner
+
+CatBoostRegressor (loss_function=RMSE) predicting expPNL
+
+CV
+
+Purged Walk‑Forward split (no leakage)
+
+Dynamic δ,T
+
+Contextual Thompson Sampling over discrete (δ,T) bins; fall‑back to PPO for continuous action
+
+Serving
+
+Model → ONNX; inference via onnxruntime‑gpu (<1 ms)
+
+Thresholds: execute if expPNL>0 and P(fill)>0.3.
+
+6. Online Decision Flow
+
+FeatureHub emits latest feature vector x.
+
+Model‑Server evaluates x across candidate (δ,T) set.
+
+Best tuple with positive expectation returned.
+
+Order‑Router calculates size via fixed‑risk or Kelly, places limit order at mid*(1-δ).
+
+TTL / cancel if unfilled after T seconds.
+
+On fill, set TP/SL or timed exit at H seconds.
+
+7. Risk Management
+
+Fees & Slippage — subtract 0.055 % taker / −0.015 % maker (VIP0) in labels.
+
+Max Exposure — cap open pos size to σ‑adjusted value: size ≤ k · account_equity / σ₅ₘ.
+
+Circuit Breaker — 5σ loss or liq_spike_z > 5 pauses bot for 10 m.
+
+Event Calendar — automatic trade‑off during CPI, FOMC, etc.
+
+8. Testing & Deployment
+
+Phase
+
+Tools
+
+Success Criteria
+
+Tick Replay
+
+DuckDB replay + pandas
+
+PNL≈offline back‑test
+
+Paper
+
+Bybit testnet
+
+No API errors, latency < 50 ms
+
+Canary
+
+10 % capital
+
+Live PNL > 0, drawdown < 2 %
+
+Full
+
+Airflow CI/CD
+
+Weekly auto‑retrain + health alerts
+
+Deployment uses Docker Compose: ingestor, featurehub, model‑server, order‑router, redis, duckdb.
+
+9. Next Actions
+
+Pull 30 d of BTCUSDT liquidation + 1 s kline.
+
+Generate labels for δ∈{5,10 %}, T∈{300,600 s}.
+
+Train CatBoost; inspect SHAP — verify liquidation features dominate.
+
+Build Redis→ONNX inference path; run on Bybit testnet.
+
+Implement Thompson Sampling module to adapt (δ,T) online.
