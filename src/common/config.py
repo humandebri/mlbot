@@ -24,7 +24,7 @@ class BybitConfig(BaseModel):
     requests_per_minute: int = 600
     
     # Symbols to trade
-    symbols: List[str] = ["BTCUSDT", "ETHUSDT"]
+    symbols: List[str] = ["BTCUSDT", "ETHUSDT", "ICPUSDT"]
     
     # WebSocket settings
     ping_interval: int = 20
