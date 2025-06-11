@@ -79,12 +79,21 @@ expected_price_drop = ML_model.predict(features)
 - **Liquidation Velocity**: 清算の加速度
 - **Long/Short Ratio**: ロング/ショート清算比率
 - **Cumulative Impact**: 累積価格影響
+- 🆕 **Size Distribution**: 歪度、尖度、バイモーダリティ
+- 🆕 **Asymmetry Metrics**: ロング/ショート非対称性
+- 🆕 **Clustering Analysis**: 清算クラスタリング検出
 
 #### 4. **時間コンテキスト** (`time_context.py`)
 - **Hour of Day**: 時間帯効果
 - **Day of Week**: 曜日効果
 - **Market Session**: アジア/欧州/米国セッション
 - **Event Proximity**: 重要イベントまでの時間
+
+#### 🆕 5. **高度な市場特徴量** (`advanced_features.py`)
+- **Open Interest Dynamics**: OI変化率、速度、加速度
+- **Taker/Maker Flow**: 攻撃的取引の検出と分析
+- **Order Flow Imbalance**: マイクロストラクチャー分析
+- **Microprice Deviation**: Volume-weighted価格偏差
 
 ### モデルアーキテクチャ
 
@@ -109,6 +118,44 @@ expPNL = (future_price / entry_price - 1) - fee - slippage
 for delta in [0.02, 0.05, 0.10]:  # 価格オフセット
     for T in [60, 300, 900]:       # ルックアヘッド期間（秒）
         label = calculate_expPNL(delta, T)
+```
+
+### 🆕 高度な機械学習技術（v1.1.0）
+
+#### 分数次差分（Fractional Differentiation）
+時系列データの定常性を保ちながら、情報を最大限に保持する技術：
+
+```python
+from src.ml_pipeline.fractional_diff import FractionalDifferentiator
+
+# 最適なdパラメータを自動探索
+frac_diff = FractionalDifferentiator()
+optimal_d = frac_diff.find_optimal_d(price_series)
+stationary_series = frac_diff.transform(price_series)
+```
+
+#### 適応的特徴量ビニング
+過学習を防ぎ、ノイズを削減する離散化技術：
+
+```python
+from src.ml_pipeline.feature_binning import AdaptiveBinner
+
+# 最適なビン数を自動決定
+binner = AdaptiveBinner()
+optimal_bins = binner.find_optimal_bins(X, y, features)
+X_binned = binner.fit_transform(X, features)
+```
+
+#### メタラベリング
+予測精度を大幅に向上させる二段階予測フレームワーク：
+
+```python
+from src.ml_pipeline.meta_labeling import MetaLabeler
+
+# Primary model: 方向予測
+# Meta model: 取引するかどうかとサイズ
+meta_labeler = MetaLabeler()
+signal = meta_labeler.generate_trading_signal(features, primary_prediction)
 ```
 
 ## 🏗️ システムアーキテクチャ詳細
@@ -760,7 +807,7 @@ MIT License - 詳細は[LICENSE](LICENSE)ファイルを参照してください
 ---
 
 **開発チーム**: ML Bot Team  
-**バージョン**: 1.0.0  
+**バージョン**: 1.1.0  
 **最終更新**: 2025年6月11日
 
 <div align="center">
