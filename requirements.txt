@@ -25,6 +25,9 @@ onnxruntime>=1.16.0
 catboost>=1.2.0
 optuna>=3.4.0
 scipy>=1.11.0
+statsmodels>=0.14.0
+numba>=0.58.0
+lightgbm>=4.1.0
 
 # FastAPI and Model Server
 fastapi>=0.104.0

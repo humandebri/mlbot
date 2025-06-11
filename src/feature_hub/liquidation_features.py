@@ -70,6 +70,11 @@ class LiquidationFeatureEngine:
         self.size_percentiles: Dict[str, Dict[str, float]] = defaultdict(dict)
         self.update_percentiles_interval = 300  # Update every 5 minutes
         self.last_percentile_update: Dict[str, float] = defaultdict(float)
+        
+        # Advanced liquidation analysis
+        self.size_distribution: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.asymmetry_metrics: Dict[str, deque] = defaultdict(lambda: deque(maxlen=300))
+        self.cluster_analysis: Dict[str, Dict[str, Any]] = defaultdict(dict)
     
     def process_liquidation(self, symbol: str, data: Dict[str, Any]) -> Dict[str, float]:
         """
@@ -139,6 +144,15 @@ class LiquidationFeatureEngine:
             # 7. Cross-symbol spillover (if multiple symbols tracked)
             if len(self.liquidation_events) > 1:
                 features.update(self._compute_spillover_features(symbol, liquidation))
+            
+            # 8. Advanced size distribution analysis
+            features.update(self._compute_size_distribution_features(symbol))
+            
+            # 9. Long/short asymmetry analysis
+            features.update(self._compute_asymmetry_features(symbol))
+            
+            # 10. Liquidation clustering analysis
+            features.update(self._compute_clustering_features(symbol))
             
             # Cache results
             self.latest_features[symbol] = features
@@ -643,6 +657,254 @@ class LiquidationFeatureEngine:
         
         return features
     
+    def _compute_size_distribution_features(self, symbol: str) -> Dict[str, float]:
+        """Compute advanced size distribution analysis features."""
+        features = {}
+        
+        try:
+            events = list(self.liquidation_events[symbol])
+            if len(events) < 30:
+                return features
+                
+            # Get size data
+            sizes = [e["size"] for e in events[-200:]]  # Last 200 events
+            size_array = np.array(sizes)
+            
+            # Distribution shape analysis
+            features["size_dist_skewness"] = float(np.abs(np.mean((size_array - np.mean(size_array)) ** 3) / (np.std(size_array) ** 3 + 1e-8)))
+            features["size_dist_kurtosis"] = float(np.mean((size_array - np.mean(size_array)) ** 4) / (np.std(size_array) ** 4 + 1e-8) - 3)
+            
+            # Log-normal distribution test (common in financial data)
+            log_sizes = np.log(size_array + 1e-8)
+            features["size_dist_log_mean"] = float(np.mean(log_sizes))
+            features["size_dist_log_std"] = float(np.std(log_sizes))
+            
+            # Bimodality detection (indicates different trader types)
+            from scipy.stats import gaussian_kde
+            kde = gaussian_kde(size_array)
+            x_range = np.linspace(size_array.min(), size_array.max(), 100)
+            density = kde(x_range)
+            
+            # Find local maxima in density
+            peaks = []
+            for i in range(1, len(density) - 1):
+                if density[i] > density[i-1] and density[i] > density[i+1]:
+                    peaks.append(i)
+            
+            features["size_dist_n_modes"] = len(peaks)
+            features["size_dist_bimodal"] = 1.0 if len(peaks) >= 2 else 0.0
+            
+            # Tail analysis
+            p95 = np.percentile(size_array, 95)
+            tail_sizes = size_array[size_array > p95]
+            if len(tail_sizes) > 0:
+                features["size_dist_tail_weight"] = float(np.sum(tail_sizes) / np.sum(size_array))
+                features["size_dist_tail_count_ratio"] = len(tail_sizes) / len(size_array)
+            
+            # Recent distribution shift
+            if len(sizes) >= 100:
+                recent_sizes = size_array[-50:]
+                older_sizes = size_array[-100:-50]
+                
+                # Kolmogorov-Smirnov test for distribution shift
+                from scipy.stats import ks_2samp
+                ks_stat, _ = ks_2samp(recent_sizes, older_sizes)
+                features["size_dist_shift_ks"] = float(ks_stat)
+                
+                # Mean and variance shift
+                features["size_dist_mean_shift"] = float(np.mean(recent_sizes) / (np.mean(older_sizes) + 1e-8))
+                features["size_dist_var_shift"] = float(np.var(recent_sizes) / (np.var(older_sizes) + 1e-8))
+                
+        except Exception as e:
+            logger.warning(f"Error computing size distribution features for {symbol}", exception=e)
+            
+        return features
+    
+    def _compute_asymmetry_features(self, symbol: str) -> Dict[str, float]:
+        """Compute long/short liquidation asymmetry features."""
+        features = {}
+        
+        try:
+            events = list(self.liquidation_events[symbol])
+            if len(events) < 20:
+                return features
+                
+            # Separate long and short liquidations
+            long_liquidations = [e for e in events if e["side"].lower() == "buy"]
+            short_liquidations = [e for e in events if e["side"].lower() == "sell"]
+            
+            if len(long_liquidations) >= 5 and len(short_liquidations) >= 5:
+                # Size asymmetry
+                long_sizes = [e["size"] for e in long_liquidations[-100:]]
+                short_sizes = [e["size"] for e in short_liquidations[-100:]]
+                
+                avg_long_size = np.mean(long_sizes)
+                avg_short_size = np.mean(short_sizes)
+                
+                features["asymmetry_size_ratio"] = avg_long_size / (avg_short_size + 1e-8)
+                features["asymmetry_size_diff"] = (avg_long_size - avg_short_size) / (avg_long_size + avg_short_size + 1e-8)
+                
+                # Volume asymmetry over different windows
+                windows = [60, 300, 900]  # 1min, 5min, 15min
+                current_time = events[-1]["timestamp"]
+                
+                for window in windows:
+                    window_start = current_time - window
+                    
+                    long_vol = sum(e["size"] for e in long_liquidations if e["timestamp"] >= window_start)
+                    short_vol = sum(e["size"] for e in short_liquidations if e["timestamp"] >= window_start)
+                    total_vol = long_vol + short_vol
+                    
+                    if total_vol > 0:
+                        features[f"asymmetry_volume_ratio_{window}s"] = short_vol / total_vol
+                        features[f"asymmetry_volume_imbalance_{window}s"] = (short_vol - long_vol) / total_vol
+                
+                # Frequency asymmetry
+                long_count = len([e for e in long_liquidations if e["timestamp"] >= current_time - 300])
+                short_count = len([e for e in short_liquidations if e["timestamp"] >= current_time - 300])
+                
+                if long_count + short_count > 0:
+                    features["asymmetry_count_ratio"] = short_count / (long_count + short_count)
+                
+                # Temporal asymmetry (are shorts clustering more than longs?)
+                if len(long_liquidations) >= 10 and len(short_liquidations) >= 10:
+                    long_times = [e["timestamp"] for e in long_liquidations[-20:]]
+                    short_times = [e["timestamp"] for e in short_liquidations[-20:]]
+                    
+                    long_intervals = np.diff(long_times) if len(long_times) > 1 else [0]
+                    short_intervals = np.diff(short_times) if len(short_times) > 1 else [0]
+                    
+                    if len(long_intervals) > 0 and len(short_intervals) > 0:
+                        # Lower CV means more regular/clustered
+                        long_cv = np.std(long_intervals) / (np.mean(long_intervals) + 1e-8)
+                        short_cv = np.std(short_intervals) / (np.mean(short_intervals) + 1e-8)
+                        
+                        features["asymmetry_temporal_clustering"] = short_cv / (long_cv + 1e-8)
+                
+                # Track asymmetry changes
+                self.asymmetry_metrics[symbol].append({
+                    "timestamp": current_time,
+                    "short_dominance": features.get("asymmetry_volume_ratio_300s", 0.5)
+                })
+                
+                # Asymmetry trend
+                if len(self.asymmetry_metrics[symbol]) >= 10:
+                    recent_metrics = list(self.asymmetry_metrics[symbol])[-10:]
+                    dominance_values = [m["short_dominance"] for m in recent_metrics]
+                    
+                    # Is short dominance increasing?
+                    x = np.arange(len(dominance_values))
+                    correlation = np.corrcoef(x, dominance_values)[0, 1] if len(dominance_values) > 2 else 0
+                    features["asymmetry_trend"] = correlation
+                    
+        except Exception as e:
+            logger.warning(f"Error computing asymmetry features for {symbol}", exception=e)
+            
+        return features
+    
+    def _compute_clustering_features(self, symbol: str) -> Dict[str, float]:
+        """Compute liquidation clustering analysis features."""
+        features = {}
+        
+        try:
+            events = list(self.liquidation_events[symbol])
+            if len(events) < 30:
+                return features
+                
+            current_time = events[-1]["timestamp"]
+            
+            # Time-based clustering using DBSCAN concept
+            recent_events = [e for e in events if current_time - e["timestamp"] <= 300]  # Last 5 minutes
+            
+            if len(recent_events) >= 10:
+                timestamps = np.array([e["timestamp"] for e in recent_events])
+                
+                # Simple clustering: events within 2 seconds are considered a cluster
+                cluster_threshold = 2.0  # seconds
+                clusters = []
+                current_cluster = [timestamps[0]]
+                
+                for i in range(1, len(timestamps)):
+                    if timestamps[i] - timestamps[i-1] <= cluster_threshold:
+                        current_cluster.append(timestamps[i])
+                    else:
+                        if len(current_cluster) >= 2:  # Minimum cluster size
+                            clusters.append(current_cluster)
+                        current_cluster = [timestamps[i]]
+                
+                if len(current_cluster) >= 2:
+                    clusters.append(current_cluster)
+                
+                features["cluster_count_5m"] = len(clusters)
+                
+                if clusters:
+                    cluster_sizes = [len(c) for c in clusters]
+                    features["cluster_avg_size"] = np.mean(cluster_sizes)
+                    features["cluster_max_size"] = max(cluster_sizes)
+                    
+                    # Cluster intensity (events per cluster per second)
+                    cluster_intensities = []
+                    for cluster in clusters:
+                        duration = max(cluster) - min(cluster) + 0.1  # Avoid division by zero
+                        intensity = len(cluster) / duration
+                        cluster_intensities.append(intensity)
+                    
+                    features["cluster_avg_intensity"] = np.mean(cluster_intensities)
+                    features["cluster_max_intensity"] = max(cluster_intensities)
+                    
+                    # Inter-cluster intervals
+                    if len(clusters) >= 2:
+                        cluster_starts = [min(c) for c in clusters]
+                        inter_cluster_intervals = np.diff(sorted(cluster_starts))
+                        
+                        features["cluster_avg_interval"] = np.mean(inter_cluster_intervals)
+                        features["cluster_interval_cv"] = np.std(inter_cluster_intervals) / (np.mean(inter_cluster_intervals) + 1e-8)
+                
+                # Size-based clustering (large liquidations triggering cascades)
+                sizes = np.array([e["size"] for e in recent_events])
+                large_threshold = np.percentile(sizes, 80) if len(sizes) >= 5 else np.mean(sizes)
+                
+                # Find cascades following large liquidations
+                cascade_events = 0
+                for i, event in enumerate(recent_events):
+                    if event["size"] >= large_threshold:
+                        # Count events within 10 seconds after this large liquidation
+                        cascade_end = event["timestamp"] + 10
+                        following_events = [e for e in recent_events[i+1:] 
+                                          if e["timestamp"] <= cascade_end]
+                        if len(following_events) >= 3:  # Minimum cascade size
+                            cascade_events += 1
+                
+                features["cluster_cascade_triggers"] = cascade_events
+                
+                # Directional clustering (do liquidations of same side cluster?)
+                for side in ["buy", "sell"]:
+                    side_events = [e for e in recent_events if e["side"].lower() == side]
+                    if len(side_events) >= 5:
+                        side_times = [e["timestamp"] for e in side_events]
+                        side_intervals = np.diff(side_times) if len(side_times) > 1 else [0]
+                        
+                        if len(side_intervals) > 0:
+                            # Lower CV indicates more clustering
+                            cv = np.std(side_intervals) / (np.mean(side_intervals) + 1e-8)
+                            features[f"cluster_{side}_cv"] = cv
+                            
+                            # Burst detection (many events in short time)
+                            short_intervals = sum(1 for interval in side_intervals if interval < 1.0)
+                            features[f"cluster_{side}_burst_ratio"] = short_intervals / len(side_intervals)
+                
+            # Update cluster analysis cache
+            self.cluster_analysis[symbol] = {
+                "last_update": current_time,
+                "cluster_count": features.get("cluster_count_5m", 0),
+                "features": features.copy()
+            }
+            
+        except Exception as e:
+            logger.warning(f"Error computing clustering features for {symbol}", exception=e)
+            
+        return features
+    
     def get_feature_summary(self, symbol: str) -> Dict[str, Any]:
         """Get summary of computed features for monitoring."""
         return {
@@ -652,5 +914,6 @@ class LiquidationFeatureEngine:
             "liquidation_events": len(self.liquidation_events.get(symbol, [])),
             "size_percentiles": self.size_percentiles.get(symbol, {}),
             "spillover_tracking": len(self.spillover_events.get(symbol, [])),
-            "latest_features": list(self.latest_features.get(symbol, {}).keys())
+            "latest_features": list(self.latest_features.get(symbol, {}).keys()),
+            "cluster_analysis": self.cluster_analysis.get(symbol, {})
         }

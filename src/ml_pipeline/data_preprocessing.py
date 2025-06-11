@@ -19,6 +19,9 @@ warnings.filterwarnings('ignore')
 
 from ..common.config import settings
 from ..common.logging import get_logger
+from .fractional_diff import FractionalDifferentiator, apply_fractional_diff_features
+from .feature_binning import FeatureBinner, AdaptiveBinner, create_interaction_bins
+from .meta_labeling import MetaLabeler
 
 logger = get_logger(__name__)
 
@@ -57,6 +60,17 @@ class DataPreprocessor:
         # Performance tracking
         self.preprocessing_time = 0.0
         
+        # Advanced feature engineering components
+        self.frac_diff = FractionalDifferentiator() if self.config.get("enable_fractional_diff", True) else None
+        self.feature_binner = FeatureBinner() if self.config.get("enable_binning", True) else None
+        self.adaptive_binner = AdaptiveBinner() if self.config.get("enable_adaptive_binning", False) else None
+        self.meta_labeler = MetaLabeler() if self.config.get("enable_meta_labeling", False) else None
+        
+        # Fractional differentiation parameters
+        self.frac_diff_params = {}
+        self.binning_strategies = {}
+        self.optimal_bins = {}
+        
     def _get_default_config(self) -> Dict[str, Any]:
         """Get default preprocessing configuration."""
         return {
@@ -92,7 +106,27 @@ class DataPreprocessor:
             # Performance
             "enable_feature_selection": True,
             "max_features": 200,  # Maximum number of features to keep
-            "validation_split": 0.2  # For feature selection validation
+            "validation_split": 0.2,  # For feature selection validation
+            
+            # Advanced feature engineering
+            "enable_fractional_diff": True,
+            "fractional_d_range": (0.0, 1.0),
+            "fractional_d_step": 0.1,
+            "fractional_threshold": 1e-4,
+            
+            # Feature binning
+            "enable_binning": True,
+            "binning_features": ["volume", "price_change", "volatility"],
+            "binning_strategy": "quantile",  # 'equal_width', 'quantile', 'kmeans', 'tree'
+            "n_bins": 10,
+            "enable_adaptive_binning": False,
+            
+            # Meta-labeling
+            "enable_meta_labeling": False,
+            "meta_primary_threshold": 0.5,
+            "meta_threshold": 0.6,
+            "meta_min_bet_size": 0.1,
+            "meta_max_bet_size": 1.0
         }
     
     def fit(self, data: pd.DataFrame, target: Optional[pd.Series] = None) -> 'DataPreprocessor':

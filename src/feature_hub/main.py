@@ -58,6 +58,7 @@ class FeatureHub:
         self.volatility_engine = None
         self.liquidation_engine = None
         self.time_context_engine = None
+        self.advanced_features_engine = None
         
         # Feature cache for ML consumption
         self.feature_cache: Dict[str, Dict[str, float]] = defaultdict(dict)
@@ -135,12 +136,14 @@ class FeatureHub:
         from .volatility_momentum import VolatilityMomentumEngine
         from .liquidation_features import LiquidationFeatureEngine
         from .time_context import TimeContextEngine
+        from .advanced_features import AdvancedFeatureAggregator
         
         # Initialize engines with optimized parameters
         self.micro_liquidity_engine = MicroLiquidityEngine()
         self.volatility_engine = VolatilityMomentumEngine()
         self.liquidation_engine = LiquidationFeatureEngine()
         self.time_context_engine = TimeContextEngine()
+        self.advanced_features_engine = AdvancedFeatureAggregator()
         
         logger.info("Feature engines initialized successfully")
     
@@ -273,12 +276,30 @@ class FeatureHub:
         if self.micro_liquidity_engine:
             features = self.micro_liquidity_engine.process_orderbook(symbol, data)
             self._merge_features(symbol, features)
+        
+        # Update advanced features with orderbook data
+        if self.advanced_features_engine:
+            bids = data.get("bids", {})
+            asks = data.get("asks", {})
+            await self.advanced_features_engine.update_orderbook(symbol, bids, asks)
     
     async def _update_trade_features(self, symbol: str, data: Dict[str, Any]):
         """Update features based on trade data."""
         if self.volatility_engine:
             features = self.volatility_engine.process_trade(symbol, data)
             self._merge_features(symbol, features)
+        
+        # Update advanced features with trade data
+        if self.advanced_features_engine:
+            # Extract trade details
+            side = data.get("side", "")
+            is_taker = data.get("is_taker", True)  # Assume taker if not specified
+            size = data.get("size", 0)
+            price = data.get("price", 0)
+            
+            await self.advanced_features_engine.update_trade(
+                symbol, side, is_taker, size, price
+            )
     
     async def _update_liquidation_features(self, symbol: str, data: Dict[str, Any]):
         """Update features based on liquidation data."""
@@ -293,6 +314,11 @@ class FeatureHub:
             "open_interest": data.get("open_interest", 0),
             "oi_timestamp": data.get("timestamp", 0)
         })
+        
+        # Update advanced features with OI data
+        if self.advanced_features_engine:
+            oi_value = data.get("open_interest", 0)
+            await self.advanced_features_engine.update_oi(symbol, oi_value)
     
     async def _update_funding_features(self, symbol: str, data: Dict[str, Any]):
         """Update features based on funding rate data."""
@@ -336,6 +362,11 @@ class FeatureHub:
         for symbol in self.symbols:
             if symbol in self.feature_cache:
                 features = self.feature_cache[symbol].copy()
+                
+                # Add advanced features if available
+                if self.advanced_features_engine:
+                    advanced_features = await self.advanced_features_engine.calculate_all_features(symbol)
+                    features.update(advanced_features)
                 
                 if features:
                     # Add metadata
