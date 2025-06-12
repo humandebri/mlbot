@@ -168,13 +168,13 @@ class BybitWebSocketClient:
         for symbol in self.symbols:
             # High-frequency feeds
             subscriptions.extend([
-                f"kline.1s.{symbol}",      # 1-second klines
-                f"orderbook.25.{symbol}",  # 25-level orderbook
-                f"trades.{symbol}",        # Real-time trades
+                f"kline.1.{symbol}",         # 1 minute klines (1s not available on v5)
+                f"orderbook.50.{symbol}",    # 50-level orderbook  
+                f"publicTrade.{symbol}",     # Public trades
             ])
             
             # Liquidation feeds (critical for our strategy)
-            subscriptions.append(f"allLiquidation.{symbol}")
+            subscriptions.append(f"liquidation.{symbol}")
         
         # Send subscription in batches to respect rate limits
         batch_size = 10
@@ -284,7 +284,7 @@ class BybitWebSocketClient:
             try:
                 await asyncio.sleep(settings.bybit.ping_interval)
                 
-                if self.websocket and not self.websocket.closed:
+                if self.websocket and hasattr(self.websocket, 'closed') and not self.websocket.closed:
                     ping_msg = {"op": "ping"}
                     await self.websocket.send(json.dumps(ping_msg))
                     self.last_ping = time.time()
@@ -297,10 +297,10 @@ class BybitWebSocketClient:
         """Extract symbol from topic string efficiently."""
         try:
             # Topic formats:
-            # kline.1s.BTCUSDT
-            # orderbook.25.BTCUSDT
-            # trades.BTCUSDT
-            # allLiquidation.BTCUSDT
+            # kline.1.BTCUSDT
+            # orderbook.50.BTCUSDT
+            # publicTrade.BTCUSDT
+            # liquidation.BTCUSDT
             parts = topic.split(".")
             if len(parts) >= 2:
                 symbol = parts[-1]  # Last part is always symbol

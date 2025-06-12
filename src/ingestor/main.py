@@ -11,8 +11,8 @@ from ..common.database import get_redis_client, RedisStreams
 from ..common.logging import get_logger, setup_logging, TradingLogger
 from ..common.monitoring import (
     MESSAGES_PROCESSED,
+    PROCESSING_TIME,
     increment_counter,
-    measure_time,
     observe_histogram,
     BATCH_FLUSH_SIZE,
     REDIS_WRITE_ERRORS,
@@ -140,10 +140,15 @@ class BybitIngestor:
     def _handle_message(self, topic: str, data: Dict[str, Any]) -> None:
         """Handle incoming WebSocket message with efficient routing."""
         try:
-            with measure_time("message_processing"):
-                self._route_message(topic, data)
-                self.message_count += 1
-                increment_counter(MESSAGES_PROCESSED, component="ingestor", symbol="all")
+            # Measure time without async context manager since this is a sync method
+            start_time = time.time()
+            self._route_message(topic, data)
+            self.message_count += 1
+            increment_counter(MESSAGES_PROCESSED, component="ingestor", symbol="all")
+            
+            # Record processing time
+            duration = time.time() - start_time
+            PROCESSING_TIME.labels(component="message_processing").observe(duration)
         
         except Exception as e:
             logger.error("Error handling message", exception=e, topic=topic)
@@ -156,9 +161,9 @@ class BybitIngestor:
             self._process_kline_message(topic, data)
         elif "orderbook" in topic:
             self._process_orderbook_message(topic, data)
-        elif "trades" in topic:
+        elif "publicTrade" in topic:
             self._process_trades_message(topic, data)
-        elif "allLiquidation" in topic:
+        elif "liquidation" in topic:
             self._process_liquidation_message(topic, data)
         else:
             logger.debug(f"Unhandled topic: {topic}")

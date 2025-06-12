@@ -19,12 +19,12 @@ class BybitConfig(BaseModel):
     api_secret: Optional[str] = None
     testnet: bool = True
     
-    # Rate limiting
-    requests_per_second: int = 10
-    requests_per_minute: int = 600
+    # Rate limiting (conservative for production safety)
+    requests_per_second: int = 5
+    requests_per_minute: int = 300
     
-    # Symbols to trade
-    symbols: List[str] = ["BTCUSDT", "ETHUSDT", "ICPUSDT"]
+    # Symbols to trade (BTCUSDT removed temporarily)
+    symbols: List[str] = ["ETHUSDT", "ICPUSDT"]
     
     # WebSocket settings
     ping_interval: int = 20
