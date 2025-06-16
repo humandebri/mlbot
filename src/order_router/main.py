@@ -20,7 +20,7 @@ from .order_executor import OrderExecutor, ExecutionConfig
 from .smart_router import SmartRouter, TradingSignal, RoutingConfig
 from ..common.config import settings
 from ..common.logging import get_logger
-from ..common.bybit_client import BybitClient
+from ..common.bybit_client import BybitRESTClient
 from ..common.monitoring import setup_metrics_server
 
 logger = get_logger(__name__)
@@ -41,10 +41,8 @@ class OrderRouter:
         """Initialize order router."""
         
         # Initialize Bybit client
-        self.bybit_client = BybitClient(
-            api_key=settings.BYBIT_API_KEY,
-            api_secret=settings.BYBIT_API_SECRET,
-            testnet=settings.USE_TESTNET
+        self.bybit_client = BybitRESTClient(
+            testnet=settings.bybit.testnet
         )
         
         # Initialize components

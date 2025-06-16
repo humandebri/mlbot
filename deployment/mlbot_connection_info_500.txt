@@ -1,0 +1,38 @@
+======================================
+MLBot AWS接続情報 (00版)
+======================================
+
+インスタンスID: i-0c09b899740a15a38
+パブリックIP: 13.212.91.54
+リージョン: ap-southeast-1
+SSHキー: ~/.ssh/mlbot-key-1749802416.pem
+
+接続コマンド:
+ssh -i ~/.ssh/mlbot-key-1749802416.pem ubuntu@13.212.91.54
+
+セットアップ完了後:
+1. モデルファイルをアップロード:
+   scp -i ~/.ssh/mlbot-key-1749802416.pem models/fast_nn_final.pth ubuntu@13.212.91.54:~/mlbot/models/
+   scp -i ~/.ssh/mlbot-key-1749802416.pem models/fast_nn_scaler.pkl ubuntu@13.212.91.54:~/mlbot/models/
+
+2. サーバーでセットアップ実行:
+   ssh -i ~/.ssh/mlbot-key-1749802416.pem ubuntu@13.212.91.54
+   cd mlbot
+   bash ../setup_mlbot_500.sh
+   source load_secrets.sh
+   docker-compose up --build -d
+
+3. ログ確認:
+   docker-compose logs -f mlbot
+
+4. 動作確認:
+   curl http://localhost:8080/health
+
+設定内容 (00版):
+- 初期資金: 00
+- 対象通貨: ICPUSDT のみ
+- ポジションサイズ: 5% (5)
+- レバレッジ: 2倍
+- 残高チェック: 15分間隔
+
+======================================

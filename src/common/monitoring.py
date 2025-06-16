@@ -21,6 +21,7 @@ REGISTRY = CollectorRegistry()
 CPU_USAGE = Gauge("system_cpu_usage_percent", "CPU usage percentage", registry=REGISTRY)
 MEMORY_USAGE = Gauge("system_memory_usage_bytes", "Memory usage in bytes", registry=REGISTRY)
 DISK_USAGE = Gauge("system_disk_usage_percent", "Disk usage percentage", registry=REGISTRY)
+SYSTEM_HEALTH = Gauge("system_health_score", "Overall system health score (0-1)", registry=REGISTRY)
 
 # Application metrics
 WEBSOCKET_CONNECTIONS = Gauge(
@@ -36,7 +37,7 @@ PROCESSING_TIME = Histogram(
     "processing_time_seconds", "Processing time in seconds", ["component"], registry=REGISTRY
 )
 MODEL_PREDICTIONS = Counter(
-    "model_predictions_total", "Total model predictions", ["symbol"], registry=REGISTRY
+    "trading_predictions_total", "Total model predictions made", ["symbol"], registry=REGISTRY
 )
 MODEL_INFERENCE_TIME = Histogram(
     "model_inference_time_seconds", "Model inference time in seconds", registry=REGISTRY
@@ -52,9 +53,36 @@ ORDERS_FILLED = Counter(
 ORDERS_CANCELLED = Counter(
     "orders_cancelled_total", "Total orders cancelled", ["symbol", "reason"], registry=REGISTRY
 )
+ORDER_LATENCY = Histogram(
+    "order_latency_seconds", "Order placement latency in seconds", ["symbol"], registry=REGISTRY
+)
 POSITION_PNL = Gauge("position_pnl", "Current position PnL", ["symbol"], registry=REGISTRY)
 PORTFOLIO_VALUE = Gauge("portfolio_value", "Total portfolio value", registry=REGISTRY)
 DRAWDOWN = Gauge("max_drawdown_percent", "Maximum drawdown percentage", registry=REGISTRY)
+
+# Model metrics
+MODEL_ERRORS = Counter(
+    "model_errors_total", "Total model errors", ["symbol"], registry=REGISTRY
+)
+SIGNALS_GENERATED = Counter(
+    "signals_generated_total", "Total trading signals generated", ["symbol", "signal_type"], registry=REGISTRY
+)
+
+# Risk management metrics
+RISK_VIOLATIONS = Counter(
+    "risk_violations_total", "Total risk violations", ["violation_type"], registry=REGISTRY
+)
+POSITION_VALUE = Gauge(
+    "position_value_usd", "Current position value in USD", ["symbol"], registry=REGISTRY
+)
+DAILY_PNL = Gauge("daily_pnl_usd", "Daily PnL in USD", registry=REGISTRY)
+
+# Position management metrics
+ACTIVE_POSITIONS = Gauge(
+    "active_positions_count", "Number of active positions", ["symbol"], registry=REGISTRY
+)
+TOTAL_PNL = Gauge("total_pnl_usd", "Total PnL in USD", registry=REGISTRY)
+WIN_RATE = Gauge("win_rate_percent", "Win rate percentage", registry=REGISTRY)
 
 # Error metrics
 ERRORS_TOTAL = Counter(
@@ -318,3 +346,21 @@ async def start_monitoring() -> tuple[HealthChecker, MetricsCollector]:
     await health_checker.run_all_checks()
     
     return health_checker, metrics_collector
+
+
+def setup_metrics_server(port: Optional[int] = None) -> None:
+    """Setup and start the Prometheus metrics server.
+    
+    Args:
+        port: Port to run the metrics server on. If None, uses config value.
+    """
+    if port is None:
+        port = settings.monitoring.prometheus_port
+    
+    if port:
+        try:
+            start_http_server(port, registry=REGISTRY)
+            logger.info(f"Prometheus metrics server started on port {port}")
+        except Exception as e:
+            logger.error(f"Failed to start metrics server on port {port}", exception=e)
+            raise

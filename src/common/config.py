@@ -115,6 +115,10 @@ class TradingConfig(BaseModel):
     # Position management
     default_hold_time: int = 300  # seconds
     max_open_positions: int = 5
+    
+    # Risk limits
+    max_daily_loss_usd: float = 10000.0
+    max_drawdown_pct: float = 0.2
 
 
 class LoggingConfig(BaseModel):
@@ -176,6 +180,9 @@ class Settings(BaseSettings):
     trading: TradingConfig = Field(default_factory=TradingConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
+    
+    # Discord webhook URL (optional)
+    discord_webhook: Optional[str] = Field(default=None, env="DISCORD_WEBHOOK")
     
     @property
     def is_production(self) -> bool:

@@ -29,6 +29,7 @@ from ..common.monitoring import (
     MODEL_PREDICTIONS, MODEL_INFERENCE_TIME,
     increment_counter, observe_histogram
 )
+from .feature_adapter_44 import FeatureAdapter44
 
 logger = get_logger(__name__)
 
@@ -38,8 +39,8 @@ class InferenceConfig:
     """Configuration for inference engine."""
     
     # Model paths
-    model_path: str = "models/v1.0/model.onnx"
-    preprocessor_path: str = "models/v1.0/preprocessor.pkl"
+    model_path: str = "models/v3.1_improved/model.onnx"
+    preprocessor_path: str = "models/v3.1_improved/scaler.pkl"
     
     # Performance settings
     max_inference_time_ms: float = 1.0
@@ -278,6 +279,22 @@ class InferenceEngine:
                 cached_result = self.prediction_cache[feature_hash]
                 logger.debug("Cache hit for prediction")
                 return cached_result
+            
+            # Adapt features to model input dimension (44)
+            if feature_array.shape[-1] != 44:
+                # Use feature adapter to convert to 44 dimensions
+                feature_adapter = FeatureAdapter44()
+                if len(feature_array.shape) == 1:
+                    # Convert single feature vector
+                    feature_dict = {f"feature_{i}": feature_array[i] for i in range(len(feature_array))}
+                    feature_array = feature_adapter.adapt(feature_dict).reshape(1, -1)
+                else:
+                    # Batch processing
+                    adapted_features = []
+                    for row in feature_array:
+                        feature_dict = {f"feature_{i}": row[i] for i in range(len(row))}
+                        adapted_features.append(feature_adapter.adapt(feature_dict))
+                    feature_array = np.array(adapted_features, dtype=np.float32)
             
             # Preprocess features if preprocessor available
             if self.preprocessor:

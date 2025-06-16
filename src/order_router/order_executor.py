@@ -24,7 +24,7 @@ from ..common.monitoring import (
     ORDERS_PLACED, ORDERS_FILLED, ORDER_LATENCY,
     increment_counter, observe_histogram
 )
-from ..common.bybit_client import BybitClient
+from ..common.bybit_client import BybitRESTClient
 
 logger = get_logger(__name__)
 
@@ -151,7 +151,7 @@ class OrderExecutor:
     
     def __init__(
         self,
-        bybit_client: BybitClient,
+        bybit_client: BybitRESTClient,
         config: Optional[ExecutionConfig] = None
     ):
         """

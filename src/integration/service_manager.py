@@ -160,13 +160,30 @@ class ManagedService:
                 raise RuntimeError(f"{self.config.name} exited during startup")
             
             # Check port if specified
-            if self.config.port and self._is_port_open(self.config.port):
-                await asyncio.sleep(1)  # Give it a moment to fully initialize
-                return
+            if self.config.port:
+                if self._is_port_open(self.config.port):
+                    await asyncio.sleep(1)  # Give it a moment to fully initialize
+                    return
+            else:
+                # For services without ports, just check if process is alive after a brief startup period
+                if time.time() - start_time > 3:  # Give it 3 seconds to start
+                    # Check if process is still running
+                    if self.process.poll() is None:
+                        logger.info(f"{self.config.name} appears to be running (no port to check)")
+                        return
             
             await asyncio.sleep(0.5)
         
-        raise TimeoutError(f"{self.config.name} failed to start within {self.config.startup_timeout}s")
+        # Only timeout if service has a port to check
+        if self.config.port:
+            raise TimeoutError(f"{self.config.name} failed to start within {self.config.startup_timeout}s")
+        else:
+            # For services without ports, if process is still running, consider it started
+            if self.process.poll() is None:
+                logger.info(f"{self.config.name} running without port verification")
+                return
+            else:
+                raise RuntimeError(f"{self.config.name} process exited")
     
     def _is_port_open(self, port: int) -> bool:
         """Check if a port is open."""
@@ -228,8 +245,8 @@ class ServiceManager:
         self.add_service(ServiceConfig(
             name="feature_hub",
             command=[sys.executable, "-m", "src.feature_hub.main"],
-            port=8002,
-            health_check_url="http://localhost:8002/health",
+            port=None,  # Feature Hub doesn't have HTTP server
+            health_check_url=None,
             env={"SERVICE_NAME": "feature_hub"}
         ))
         

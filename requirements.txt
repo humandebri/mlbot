@@ -46,4 +46,7 @@ plotly>=5.15.0
 # Statistics
 statsmodels>=0.14.0
 numba>=0.57.0
-EOF < /dev/null
+
+# ONNX Runtime
+onnx>=1.14.0
+onnxruntime>=1.16.0

@@ -19,7 +19,7 @@ import numpy as np
 from ..common.config import settings
 from ..common.logging import get_logger
 from ..common.monitoring import (
-    SIGNALS_GENERATED, PREDICTIONS_MADE, SYSTEM_HEALTH,
+    SIGNALS_GENERATED, MODEL_PREDICTIONS, ORDERS_PLACED, SYSTEM_HEALTH,
     increment_counter, set_gauge
 )
 from ..common.database import RedisManager
@@ -231,7 +231,7 @@ class TradingCoordinator:
             # Update tracking
             self.last_predictions[symbol] = datetime.now()
             self.prediction_count += 1
-            increment_counter(PREDICTIONS_MADE, symbol=symbol)
+            increment_counter(MODEL_PREDICTIONS, symbol=symbol)
             
         except Exception as e:
             logger.error("Error processing symbol prediction",

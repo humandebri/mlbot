@@ -403,3 +403,21 @@ async def close_databases() -> None:
     """Close all database connections."""
     await close_redis()
     close_duckdb()
+
+
+class RedisManager:
+    """Redis connection manager for trading system."""
+    
+    def __init__(self):
+        self.redis: Optional[Redis] = None
+    
+    async def connect(self) -> None:
+        """Connect to Redis."""
+        self.redis = await get_redis_client()
+        logger.info("RedisManager connected to Redis")
+    
+    async def close(self) -> None:
+        """Close Redis connection."""
+        if self.redis:
+            await self.redis.close()
+            logger.info("RedisManager closed Redis connection")
