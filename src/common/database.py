@@ -125,6 +125,153 @@ def close_duckdb() -> None:
         logger.info("DuckDB connection closed")
 
 
+def create_trading_tables() -> None:
+    """Create trading history tables if they don't exist."""
+    conn = get_duckdb_connection()
+    
+    # Create trades table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            trade_id VARCHAR PRIMARY KEY,
+            position_id VARCHAR,
+            symbol VARCHAR NOT NULL,
+            side VARCHAR NOT NULL,
+            order_type VARCHAR NOT NULL,
+            quantity DOUBLE NOT NULL,
+            price DOUBLE NOT NULL,
+            executed_at TIMESTAMP NOT NULL,
+            fees DOUBLE DEFAULT 0,
+            status VARCHAR DEFAULT 'pending',
+            metadata JSON
+        )
+    """)
+    
+    # Create positions table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            position_id VARCHAR PRIMARY KEY,
+            symbol VARCHAR NOT NULL,
+            side VARCHAR NOT NULL,
+            entry_price DOUBLE NOT NULL,
+            exit_price DOUBLE,
+            quantity DOUBLE NOT NULL,
+            stop_loss DOUBLE,
+            take_profit DOUBLE,
+            opened_at TIMESTAMP NOT NULL,
+            closed_at TIMESTAMP,
+            pnl DOUBLE,
+            fees DOUBLE DEFAULT 0,
+            status VARCHAR DEFAULT 'open',
+            metadata JSON
+        )
+    """)
+    
+    # Create performance table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS performance (
+            date DATE PRIMARY KEY,
+            total_trades INTEGER,
+            winning_trades INTEGER,
+            losing_trades INTEGER,
+            total_pnl DOUBLE,
+            total_fees DOUBLE,
+            max_drawdown DOUBLE,
+            sharpe_ratio DOUBLE,
+            win_rate DOUBLE,
+            avg_win DOUBLE,
+            avg_loss DOUBLE
+        )
+    """)
+    
+    conn.commit()
+    logger.info("Trading tables created successfully")
+
+
+def save_trade(
+    trade_id: str,
+    position_id: str,
+    symbol: str,
+    side: str,
+    order_type: str,
+    quantity: float,
+    price: float,
+    fees: float = 0,
+    status: str = "executed",
+    metadata: Optional[Dict[str, Any]] = None
+) -> None:
+    """Save trade to database."""
+    conn = get_duckdb_connection()
+    
+    try:
+        conn.execute("""
+            INSERT INTO trades (
+                trade_id, position_id, symbol, side, order_type,
+                quantity, price, executed_at, fees, status, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?)
+        """, (
+            trade_id, position_id, symbol, side, order_type,
+            quantity, price, fees, status, json.dumps(metadata or {})
+        ))
+        conn.commit()
+        logger.info(f"Trade saved: {trade_id}")
+    except Exception as e:
+        logger.error(f"Failed to save trade: {e}")
+        conn.rollback()
+
+
+def save_position(
+    position_id: str,
+    symbol: str,
+    side: str,
+    entry_price: float,
+    quantity: float,
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+    metadata: Optional[Dict[str, Any]] = None
+) -> None:
+    """Save position to database."""
+    conn = get_duckdb_connection()
+    
+    try:
+        conn.execute("""
+            INSERT INTO positions (
+                position_id, symbol, side, entry_price, quantity,
+                stop_loss, take_profit, opened_at, status, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 'open', ?)
+        """, (
+            position_id, symbol, side, entry_price, quantity,
+            stop_loss, take_profit, json.dumps(metadata or {})
+        ))
+        conn.commit()
+        logger.info(f"Position saved: {position_id}")
+    except Exception as e:
+        logger.error(f"Failed to save position: {e}")
+        conn.rollback()
+
+
+def update_position_close(
+    position_id: str,
+    exit_price: float,
+    pnl: float,
+    fees: float = 0
+) -> None:
+    """Update position when closed."""
+    conn = get_duckdb_connection()
+    
+    try:
+        conn.execute("""
+            UPDATE positions 
+            SET exit_price = ?, pnl = ?, fees = ?, 
+                closed_at = NOW(), status = 'closed'
+            WHERE position_id = ?
+        """, (exit_price, pnl, fees, position_id))
+        conn.commit()
+        logger.info(f"Position closed: {position_id}, PnL: {pnl}")
+    except Exception as e:
+        logger.error(f"Failed to update position: {e}")
+        conn.rollback()
+
+
 class RedisStreams:
     """Redis Streams helper for real-time data."""
     

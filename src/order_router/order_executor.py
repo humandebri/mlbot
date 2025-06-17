@@ -281,7 +281,14 @@ class OrderExecutor:
             
             # Place order on exchange
             response = await self._execute_with_retry(
-                lambda: self.client.place_order(**params)
+                lambda: self.client.create_order(
+                    symbol=order.symbol,
+                    side=order.side,
+                    order_type=order.order_type.value,
+                    qty=order.quantity,
+                    price=order.price if order.order_type != OrderType.MARKET else None,
+                    reduce_only=order.reduce_only
+                )
             )
             
             # Update order with exchange response

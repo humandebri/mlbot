@@ -245,7 +245,7 @@ class InferenceEngine:
     
     def predict(
         self,
-        features: Union[pd.DataFrame, np.ndarray],
+        features: Union[pd.DataFrame, np.ndarray, Dict[str, float]],
         return_confidence: bool = True,
         use_cache: bool = True
     ) -> Dict[str, Any]:
@@ -270,6 +270,18 @@ class InferenceEngine:
             if isinstance(features, pd.DataFrame):
                 feature_array = features.values.astype(np.float32)
                 feature_hash = hash(features.values.tobytes()) if use_cache else None
+            elif isinstance(features, dict):
+                # Convert dict to numpy array using FeatureAdapter44
+                try:
+                    from .feature_adapter_44 import FeatureAdapter44
+                    adapter = FeatureAdapter44()
+                    feature_array = adapter.adapt(features).astype(np.float32).reshape(1, -1)
+                    feature_hash = hash(str(sorted(features.items())).encode()) if use_cache else None
+                except ImportError:
+                    # Fallback: use sorted dict values
+                    feature_values = [features.get(key, 0.0) for key in sorted(features.keys())]
+                    feature_array = np.array(feature_values, dtype=np.float32).reshape(1, -1)
+                    feature_hash = hash(str(sorted(features.items())).encode()) if use_cache else None
             else:
                 feature_array = features.astype(np.float32)
                 feature_hash = hash(feature_array.tobytes()) if use_cache else None
@@ -299,7 +311,9 @@ class InferenceEngine:
             # Preprocess features if preprocessor available
             if self.preprocessor:
                 if hasattr(self.preprocessor, 'transform'):
-                    feature_array = self.preprocessor.transform(feature_array)
+                    # Ensure input is float32 before scaling
+                    feature_array = feature_array.astype(np.float32)
+                    feature_array = self.preprocessor.transform(feature_array).astype(np.float32)
             
             # Make prediction
             prediction_raw = self.onnx_session.run(
@@ -440,7 +454,10 @@ class InferenceEngine:
     ) -> np.ndarray:
         """Apply Thompson Sampling parameter adjustments."""
         if not self.thompson_sampler:
-            return predictions
+            return predictions.astype(np.float32)
+        
+        # Ensure predictions are float32
+        predictions = predictions.astype(np.float32)
         
         # Get current Thompson parameters
         params = self.thompson_sampler.current_values
@@ -448,14 +465,18 @@ class InferenceEngine:
         # Apply confidence threshold adjustment
         confidence_threshold = params.get("confidence_threshold", self.config.confidence_threshold)
         if confidence_scores is not None:
+            confidence_scores = confidence_scores.astype(np.float32)
             low_confidence_mask = confidence_scores < confidence_threshold
-            predictions[low_confidence_mask] *= 0.5  # Reduce low-confidence predictions
+            # Create a copy to avoid in-place modification issues
+            adjusted_predictions = predictions.copy()
+            adjusted_predictions[low_confidence_mask] *= 0.5  # Reduce low-confidence predictions
+            predictions = adjusted_predictions
         
         # Apply risk adjustment factor
-        risk_factor = params.get("risk_adjustment_factor", 1.0)
+        risk_factor = float(params.get("risk_adjustment_factor", 1.0))
         adjusted_predictions = predictions * risk_factor
         
-        return adjusted_predictions
+        return adjusted_predictions.astype(np.float32)
     
     def _apply_risk_adjustments(
         self, 
@@ -464,20 +485,23 @@ class InferenceEngine:
     ) -> np.ndarray:
         """Apply risk management adjustments to predictions."""
         if not self.config.risk_adjustment:
-            return predictions
+            return predictions.astype(np.float32)
         
+        # Ensure predictions are float32
+        predictions = predictions.astype(np.float32)
         adjusted_predictions = predictions.copy()
         
         # Position sizing based on confidence
         if confidence_scores is not None:
-            position_sizes = confidence_scores * self.config.max_position_size
+            confidence_scores = confidence_scores.astype(np.float32)
+            position_sizes = confidence_scores * float(self.config.max_position_size)
             adjusted_predictions = adjusted_predictions * position_sizes
         
         # Cap extreme predictions
         percentile_99 = np.percentile(np.abs(adjusted_predictions), 99)
         adjusted_predictions = np.clip(adjusted_predictions, -percentile_99, percentile_99)
         
-        return adjusted_predictions
+        return adjusted_predictions.astype(np.float32)
     
     def _warmup_model(self) -> None:
         """Warm up model with dummy data to improve first inference speed."""

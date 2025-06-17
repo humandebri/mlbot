@@ -146,15 +146,19 @@ class AccountMonitor:
                     return default
             
             equity = safe_float(usdt_balance.get("equity"))
-            available = safe_float(usdt_balance.get("availableToWithdraw"))
+            # availableToWithdrawは出金可能額なので、walletBalanceを使用
+            available = safe_float(usdt_balance.get("walletBalance"))
             unrealized_pnl = safe_float(usdt_balance.get("unrealisedPnl"))
             usd_value = safe_float(usdt_balance.get("usdValue"))
             
+            # 全体のアカウント情報から取引可能残高を取得
+            total_available = safe_float(balance_data.get("totalAvailableBalance", available))
+            
             balance = AccountBalance(
                 total_equity=equity,
-                available_balance=available,
+                available_balance=total_available,  # 実際の取引可能残高
                 unrealized_pnl=unrealized_pnl,
-                used_margin=usd_value - available
+                used_margin=equity - total_available  # 使用中マージン
             )
             
             # Update current balance

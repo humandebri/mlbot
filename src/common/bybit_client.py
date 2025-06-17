@@ -1,6 +1,8 @@
 """Bybit WebSocket and REST API client with optimized performance."""
 
 import asyncio
+import hashlib
+import hmac
 import json
 import time
 from contextlib import asynccontextmanager
@@ -328,6 +330,10 @@ class BybitRESTClient:
             else settings.bybit.base_url
         )
         
+        # API credentials
+        self.api_key = settings.bybit.api_key
+        self.api_secret = settings.bybit.api_secret
+        
         # Rate limiting
         self.request_semaphore = asyncio.Semaphore(settings.bybit.requests_per_second)
         self.request_times: List[float] = []
@@ -475,6 +481,283 @@ class BybitRESTClient:
                 await asyncio.sleep(wait_time)
         
         self.request_times.append(now)
+    
+    async def get_open_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get open positions."""
+        try:
+            async with self.request_semaphore:
+                await self._wait_for_rate_limit()
+                
+                url = urljoin(self.base_url, "/v5/position/list")
+                params = {
+                    "category": "linear",
+                    "settleCoin": "USDT"
+                }
+                if symbol:
+                    params["symbol"] = symbol
+                
+                async with self.session.get(url, params=params, headers=self._get_auth_headers("GET", "/v5/position/list", params)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("retCode") == 0:
+                            return data.get("result", {}).get("list", [])
+                        else:
+                            logger.error(f"API error getting positions: {data.get('retMsg')}")
+                    else:
+                        logger.error(f"HTTP error {response.status} getting positions")
+                        
+        except Exception as e:
+            logger.error("Error fetching positions", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+        
+        return []
+    
+    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get open orders."""
+        try:
+            async with self.request_semaphore:
+                await self._wait_for_rate_limit()
+                
+                url = urljoin(self.base_url, "/v5/order/realtime")
+                params = {
+                    "category": "linear",
+                    "settleCoin": "USDT"
+                }
+                if symbol:
+                    params["symbol"] = symbol
+                
+                async with self.session.get(url, params=params, headers=self._get_auth_headers("GET", "/v5/order/realtime", params)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("retCode") == 0:
+                            return data.get("result", {}).get("list", [])
+                        else:
+                            logger.error(f"API error getting orders: {data.get('retMsg')}")
+                    else:
+                        logger.error(f"HTTP error {response.status} getting orders")
+                        
+        except Exception as e:
+            logger.error("Error fetching orders", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+        
+        return []
+    
+    async def create_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        qty: float,
+        price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        reduce_only: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Create a new order."""
+        try:
+            async with self.request_semaphore:
+                await self._wait_for_rate_limit()
+                
+                url = urljoin(self.base_url, "/v5/order/create")
+                params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "side": side.capitalize(),  # Buy/Sell
+                    "orderType": order_type.capitalize(),  # Limit/Market
+                    "qty": str(qty),
+                    "reduceOnly": reduce_only
+                }
+                
+                if price and order_type.lower() == "limit":
+                    params["price"] = str(price)
+                
+                if stop_loss:
+                    params["stopLoss"] = str(stop_loss)
+                    
+                if take_profit:
+                    params["takeProfit"] = str(take_profit)
+                
+                headers = self._get_auth_headers("POST", "/v5/order/create", params)
+                
+                async with self.session.post(url, json=params, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("retCode") == 0:
+                            logger.info(f"Order created: {data.get('result')}")
+                            return data.get("result")
+                        else:
+                            logger.error(f"API error creating order: {data.get('retMsg')}")
+                    else:
+                        logger.error(f"HTTP error {response.status} creating order")
+                        
+        except Exception as e:
+            logger.error("Error creating order", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+        
+        return None
+    
+    async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """Cancel an order."""
+        try:
+            async with self.request_semaphore:
+                await self._wait_for_rate_limit()
+                
+                url = urljoin(self.base_url, "/v5/order/cancel")
+                params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "orderId": order_id
+                }
+                
+                headers = self._get_auth_headers("POST", "/v5/order/cancel", params)
+                
+                async with self.session.post(url, json=params, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("retCode") == 0:
+                            logger.info(f"Order cancelled: {order_id}")
+                            return True
+                        else:
+                            logger.error(f"API error cancelling order: {data.get('retMsg')}")
+                    else:
+                        logger.error(f"HTTP error {response.status} cancelling order")
+                        
+        except Exception as e:
+            logger.error("Error cancelling order", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+        
+        return False
+    
+    async def close_position(self, symbol: str, side: str = None) -> bool:
+        """Close a position by creating a reduce-only market order."""
+        try:
+            # First get the open position
+            positions = await self.get_open_positions(symbol)
+            if not positions:
+                logger.warning(f"No open position found for {symbol}")
+                return False
+            
+            position = positions[0]
+            position_side = position.get("side")  # Buy or Sell
+            position_size = float(position.get("size", 0))
+            
+            if position_size == 0:
+                logger.warning(f"Position size is 0 for {symbol}")
+                return False
+            
+            # Determine closing side (opposite of position side)
+            close_side = "Sell" if position_side == "Buy" else "Buy"
+            
+            # Create reduce-only market order to close
+            result = await self.create_order(
+                symbol=symbol,
+                side=close_side,
+                order_type="Market",
+                qty=position_size,
+                reduce_only=True
+            )
+            
+            return result is not None
+            
+        except Exception as e:
+            logger.error("Error closing position", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+        
+        return False
+    
+    async def set_stop_loss(self, symbol: str, stop_loss: float) -> bool:
+        """Set or update stop loss for a position."""
+        try:
+            async with self.request_semaphore:
+                await self._wait_for_rate_limit()
+                
+                url = urljoin(self.base_url, "/v5/position/trading-stop")
+                params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "stopLoss": str(stop_loss)
+                }
+                
+                headers = self._get_auth_headers("POST", "/v5/position/trading-stop", params)
+                
+                async with self.session.post(url, json=params, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("retCode") == 0:
+                            logger.info(f"Stop loss set for {symbol}: {stop_loss}")
+                            return True
+                        else:
+                            logger.error(f"API error setting stop loss: {data.get('retMsg')}")
+                    else:
+                        logger.error(f"HTTP error {response.status} setting stop loss")
+                        
+        except Exception as e:
+            logger.error("Error setting stop loss", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+        
+        return False
+    
+    async def set_take_profit(self, symbol: str, take_profit: float) -> bool:
+        """Set or update take profit for a position."""
+        try:
+            async with self.request_semaphore:
+                await self._wait_for_rate_limit()
+                
+                url = urljoin(self.base_url, "/v5/position/trading-stop")
+                params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "takeProfit": str(take_profit)
+                }
+                
+                headers = self._get_auth_headers("POST", "/v5/position/trading-stop", params)
+                
+                async with self.session.post(url, json=params, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("retCode") == 0:
+                            logger.info(f"Take profit set for {symbol}: {take_profit}")
+                            return True
+                        else:
+                            logger.error(f"API error setting take profit: {data.get('retMsg')}")
+                    else:
+                        logger.error(f"HTTP error {response.status} setting take profit")
+                        
+        except Exception as e:
+            logger.error("Error setting take profit", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+        
+        return False
+    
+    def _get_auth_headers(self, method: str, endpoint: str, params: Dict[str, Any]) -> Dict[str, str]:
+        """Generate authentication headers for Bybit API."""
+        if not self.api_key or not self.api_secret:
+            return {}
+        
+        timestamp = str(int(time.time() * 1000))
+        
+        # Create param string
+        if method == "GET":
+            param_str = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+        else:
+            param_str = json.dumps(params, separators=(',', ':'))
+        
+        # Create signature
+        recv_window = "5000"
+        sign_str = f"{timestamp}{self.api_key}{recv_window}{param_str}"
+        signature = hmac.new(
+            self.api_secret.encode('utf-8'),
+            sign_str.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        
+        return {
+            "X-BAPI-API-KEY": self.api_key,
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "Content-Type": "application/json"
+        }
 
 
 @asynccontextmanager
