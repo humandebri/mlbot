@@ -9,21 +9,39 @@ Comprehensive risk controls including:
 - Dynamic risk adjustment
 """
 
-import numpy as np
-import pandas as pd
-from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from collections import defaultdict
 import asyncio
 import warnings
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
 warnings.filterwarnings('ignore')
 
 from ..common.config import settings
+from ..common.config_manager import ConfigManager
+from ..common.decorators import profile_performance, with_error_handling
+from ..common.error_handler import error_context
+from ..common.exceptions import RiskManagementError
 from ..common.logging import get_logger
 from ..common.monitoring import (
-    RISK_VIOLATIONS, POSITION_VALUE, DAILY_PNL,
-    increment_counter, set_gauge
+    DAILY_PNL,
+    POSITION_VALUE,
+    RISK_VIOLATIONS,
+    increment_counter,
+    set_gauge,
+)
+from ..common.performance import performance_context
+from ..common.types import Decimal, RiskLevel, RiskMetrics, Symbol
+from ..common.utils import (
+    clamp,
+    safe_decimal,
+    safe_float,
+    format_currency,
+    format_percentage,
 )
 
 logger = get_logger(__name__)
@@ -31,23 +49,51 @@ logger = get_logger(__name__)
 
 @dataclass
 class RiskConfig:
-    """Risk management configuration."""
+    """Risk management configuration with safe defaults."""
     
-    # Position limits (adjusted for $100 account)
-    max_position_size_usd: float = 30.0  # Maximum position size per symbol ($100 * 30%)
-    max_total_exposure_usd: float = 60.0  # Maximum total exposure ($100 * 60%)
-    max_leverage: float = 3.0  # Maximum leverage allowed (safer)
-    max_positions: int = 3  # Maximum number of concurrent positions (reduced)
+    # Position limits (adjusted for account size)
+    max_position_size_usd: float = field(default=30.0)  # Maximum position size per symbol
+    max_total_exposure_usd: float = field(default=60.0)  # Maximum total exposure
+    max_leverage: float = field(default=3.0)  # Maximum leverage allowed
+    max_positions: int = field(default=3)  # Maximum concurrent positions
     
-    # Loss limits (adjusted for $100 account)
-    max_daily_loss_usd: float = 10.0  # Maximum daily loss (10% of account)
-    max_drawdown_pct: float = 0.20  # Maximum drawdown (20%)
-    stop_loss_pct: float = 0.02  # Default stop loss (2%)
-    trailing_stop_pct: float = 0.015  # Trailing stop loss (1.5%)
+    # Loss limits
+    max_daily_loss_usd: float = field(default=10.0)  # Maximum daily loss
+    max_drawdown_pct: float = field(default=0.20)  # Maximum drawdown (20%)
+    stop_loss_pct: float = field(default=0.02)  # Default stop loss (2%)
+    trailing_stop_pct: float = field(default=0.015)  # Trailing stop loss (1.5%)
     
     # Risk per trade
-    risk_per_trade_pct: float = 0.01  # Risk 1% of capital per trade
-    kelly_fraction: float = 0.25  # Fractional Kelly for position sizing
+    risk_per_trade_pct: float = field(default=0.01)  # Risk per trade (1%)
+    kelly_fraction: float = field(default=0.25)  # Fractional Kelly for position sizing
+    
+    def __post_init__(self):
+        """Validate configuration values."""
+        # Clamp values to safe ranges
+        self.max_leverage = clamp(self.max_leverage, 1.0, 10.0)
+        self.max_drawdown_pct = clamp(self.max_drawdown_pct, 0.05, 0.50)
+        self.stop_loss_pct = clamp(self.stop_loss_pct, 0.005, 0.10)
+        self.risk_per_trade_pct = clamp(self.risk_per_trade_pct, 0.001, 0.05)
+        self.kelly_fraction = clamp(self.kelly_fraction, 0.1, 1.0)
+    
+    @classmethod
+    def from_config(cls, config_manager: ConfigManager) -> 'RiskConfig':
+        """Create RiskConfig from configuration manager."""
+        config = config_manager.get_config()
+        trading_config = config.trading
+        
+        return cls(
+            max_position_size_usd=safe_float(trading_config.max_position_size_usd, 30.0),
+            max_total_exposure_usd=safe_float(trading_config.max_total_exposure_usd, 60.0),
+            max_leverage=safe_float(trading_config.max_leverage, 3.0),
+            max_positions=safe_float(trading_config.max_positions, 3),
+            max_daily_loss_usd=safe_float(trading_config.max_daily_loss_usd, 10.0),
+            max_drawdown_pct=safe_float(trading_config.max_drawdown_pct, 0.20),
+            stop_loss_pct=safe_float(trading_config.stop_loss_pct, 0.02),
+            trailing_stop_pct=safe_float(trading_config.trailing_stop_pct, 0.015),
+            risk_per_trade_pct=safe_float(trading_config.risk_per_trade_pct, 0.01),
+            kelly_fraction=safe_float(trading_config.kelly_fraction, 0.25)
+        )
     
     # Correlation limits
     max_correlated_positions: int = 5  # Max positions in correlated assets
@@ -74,38 +120,38 @@ class RiskConfig:
 
 @dataclass
 class Position:
-    """Trading position information."""
+    """Trading position information with enhanced type safety."""
     
-    symbol: str
+    symbol: Symbol
     side: str  # 'long' or 'short'
-    quantity: float
-    entry_price: float
-    current_price: float
+    quantity: Decimal
+    entry_price: Decimal
+    current_price: Decimal
     position_id: str
     timestamp: datetime
     
     # Risk parameters
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    trailing_stop_distance: Optional[float] = None
-    max_position_value: float = 0.0
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+    trailing_stop_distance: Optional[Decimal] = None
+    max_position_value: Decimal = field(default_factory=lambda: Decimal('0'))
     
     # Performance tracking
-    realized_pnl: float = 0.0
-    unrealized_pnl: float = 0.0
-    fees_paid: float = 0.0
+    realized_pnl: Decimal = field(default_factory=lambda: Decimal('0'))
+    unrealized_pnl: Decimal = field(default_factory=lambda: Decimal('0'))
+    fees_paid: Decimal = field(default_factory=lambda: Decimal('0'))
     
     # Metadata
     strategy: str = "liquidation_cascade"
     tags: List[str] = field(default_factory=list)
     
     @property
-    def position_value(self) -> float:
+    def position_value(self) -> Decimal:
         """Current position value in USD."""
         return abs(self.quantity * self.current_price)
     
     @property
-    def pnl(self) -> float:
+    def pnl(self) -> Decimal:
         """Total PnL (realized + unrealized)."""
         return self.realized_pnl + self.unrealized_pnl
     
@@ -113,20 +159,37 @@ class Position:
     def pnl_pct(self) -> float:
         """PnL percentage."""
         entry_value = abs(self.quantity * self.entry_price)
-        return (self.pnl / entry_value * 100) if entry_value > 0 else 0.0
+        if entry_value > 0:
+            return float((self.pnl / entry_value) * 100)
+        return 0.0
     
-    def update_price(self, new_price: float) -> None:
-        """Update position with new price."""
-        self.current_price = new_price
+    def update_price(self, new_price: Decimal) -> None:
+        """Update position with new price safely."""
+        self.current_price = safe_decimal(new_price)
         
         # Update unrealized PnL
+        price_diff = self.current_price - self.entry_price
         if self.side == 'long':
-            self.unrealized_pnl = self.quantity * (new_price - self.entry_price)
+            self.unrealized_pnl = self.quantity * price_diff
         else:  # short
-            self.unrealized_pnl = self.quantity * (self.entry_price - new_price)
+            self.unrealized_pnl = self.quantity * (-price_diff)
         
         # Update max position value for trailing stop
-        self.max_position_value = max(self.max_position_value, self.position_value)
+        current_value = self.position_value
+        self.max_position_value = max(self.max_position_value, current_value)
+    
+    def get_risk_level(self) -> RiskLevel:
+        """Determine risk level based on PnL percentage."""
+        pnl_pct = abs(self.pnl_pct)
+        
+        if pnl_pct >= 15.0:
+            return RiskLevel.CRITICAL
+        elif pnl_pct >= 10.0:
+            return RiskLevel.HIGH
+        elif pnl_pct >= 5.0:
+            return RiskLevel.MEDIUM
+        else:
+            return RiskLevel.LOW
 
 
 class RiskManager:
@@ -143,12 +206,13 @@ class RiskManager:
     
     def __init__(self, config: Optional[RiskConfig] = None):
         """
-        Initialize risk manager.
+        Initialize risk manager with enhanced configuration.
         
         Args:
             config: Risk management configuration
         """
-        self.config = config or RiskConfig()
+        self.config_manager = ConfigManager()
+        self.config = config or RiskConfig.from_config(self.config_manager)
         
         # Position tracking
         self.positions: Dict[str, Position] = {}
@@ -185,57 +249,74 @@ class RiskManager:
         
         logger.info("Risk manager initialized", config=self.config.__dict__)
     
-    def can_trade(self, symbol: str, side: str = None, size: float = None) -> bool:
+    @profile_performance()
+    def can_trade(self, symbol: Symbol, side: Optional[str] = None, size: Optional[Decimal] = None) -> bool:
         """
         Check if trading is allowed for the given symbol.
         
         Args:
-            symbol: Trading symbol (e.g., 'BTCUSDT')
+            symbol: Trading symbol
             side: Order side ('buy' or 'sell') - optional
             size: Position size in USD - optional
             
         Returns:
             bool: True if trading is allowed, False otherwise
         """
-        try:
-            # Check if we're in circuit breaker mode
-            if hasattr(self, '_circuit_breaker_active') and self._circuit_breaker_active:
-                return False
-                
-            # Check daily loss limits
-            if hasattr(self, '_daily_loss') and self._daily_loss >= self.config.max_daily_loss_usd:
-                return False
-                
-            # Check if we've hit the drawdown limit
-            if hasattr(self, '_current_drawdown') and self._current_drawdown >= self.config.max_drawdown_pct:
-                return False
-                
-            # Check maximum positions limit
-            if hasattr(self, '_active_positions') and len(self._active_positions) >= self.config.max_positions:
-                return False
-                
-            # Check if we're in cooldown period
-            if hasattr(self, '_last_trade_time'):
-                import time
-                if time.time() - self._last_trade_time < self.config.cooldown_period_seconds:
+        with error_context({"symbol": symbol, "side": side, "size": size}):
+            try:
+                # Check if we're in circuit breaker mode
+                if getattr(self, '_circuit_breaker_active', False):
+                    logger.warning(f"Circuit breaker active, blocking trade for {symbol}")
                     return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error checking trade permission: {e}")
-            return False  # Default to safe mode
+                    
+                # Check daily loss limits
+                daily_loss = safe_float(getattr(self, '_daily_loss', 0))
+                if daily_loss >= self.config.max_daily_loss_usd:
+                    logger.warning(f"Daily loss limit exceeded: {format_currency(daily_loss)}")
+                    return False
+                    
+                # Check if we've hit the drawdown limit
+                current_drawdown = safe_float(getattr(self, '_current_drawdown', 0))
+                if current_drawdown >= self.config.max_drawdown_pct:
+                    logger.warning(f"Drawdown limit exceeded: {format_percentage(current_drawdown)}")
+                    return False
+                    
+                # Check maximum positions limit
+                active_positions = getattr(self, '_active_positions', {})
+                if len(active_positions) >= self.config.max_positions:
+                    logger.warning(f"Maximum positions limit reached: {len(active_positions)}/{self.config.max_positions}")
+                    return False
+                    
+                # Check if we're in cooldown period
+                last_trade_time = getattr(self, '_last_trade_time', 0)
+                current_time = get_utc_timestamp() / 1000.0
+                cooldown_remaining = self.config.cooldown_period_seconds - (current_time - last_trade_time)
+                if cooldown_remaining > 0:
+                    logger.debug(f"Cooldown period active: {cooldown_remaining:.1f}s remaining")
+                    return False
+                
+                return True
+                
+            except Exception as e:
+                error_handler.handle_error(RiskManagementError(f"Error checking trade permission: {e}"), {
+                    "symbol": symbol,
+                    "side": side,
+                    "size": size
+                })
+                return False  # Default to safe mode
     
+    @profile_performance()
+    @with_error_handling(RiskManagementError)
     async def check_order_risk(
         self,
-        symbol: str,
+        symbol: Symbol,
         side: str,
-        quantity: float,
-        price: float,
+        quantity: Decimal,
+        price: Decimal,
         order_type: str = "limit"
     ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
         """
-        Check if order passes risk controls.
+        Check if order passes comprehensive risk controls.
         
         Args:
             symbol: Trading symbol
@@ -247,42 +328,61 @@ class RiskManager:
         Returns:
             Tuple of (approved, rejection_reason, risk_metrics)
         """
-        async with self._lock:
-            try:
-                # Check if trading is halted
-                if self.trading_halted:
-                    return False, f"Trading halted: {self.halt_reason}", {}
+        with performance_context(f"risk_check_{symbol}"):
+            async with self._lock:
+                # Safely convert inputs
+                safe_quantity = safe_decimal(quantity)
+                safe_price = safe_decimal(price)
                 
-                # Check rate limits
-                rate_check = self._check_rate_limits()
-                if not rate_check[0]:
-                    return False, rate_check[1], {}
+                context = {
+                    "symbol": symbol,
+                    "side": side,
+                    "quantity": float(safe_quantity),
+                    "price": float(safe_price),
+                    "order_type": order_type
+                }
                 
-                # Check cooldown period
-                cooldown_check = self._check_cooldown(symbol)
-                if not cooldown_check[0]:
-                    return False, cooldown_check[1], {}
-                
-                # Calculate position value
-                position_value = quantity * price
-                
-                # Check position size limits
-                size_check = self._check_position_size(symbol, position_value)
-                if not size_check[0]:
-                    return False, size_check[1], {}
-                
-                # Check total exposure
-                exposure_check = self._check_total_exposure(position_value)
-                if not exposure_check[0]:
-                    return False, exposure_check[1], {}
-                
-                # Check correlation limits
-                correlation_check = await self._check_correlation_limits(symbol)
-                if not correlation_check[0]:
-                    return False, correlation_check[1], {}
-                
-                # Check leverage
-                leverage_check = self._check_leverage(position_value)
+                with error_context(context):
+                    # Check if trading is halted
+                    if getattr(self, 'trading_halted', False):
+                        halt_reason = getattr(self, 'halt_reason', 'Unknown')
+                        increment_counter(RISK_VIOLATIONS, violation_type="trading_halted")
+                        return False, f"Trading halted: {halt_reason}", {}
+                    
+                    # Quick pre-checks
+                    if not self.can_trade(symbol, side):
+                        increment_counter(RISK_VIOLATIONS, violation_type="basic_checks")
+                        return False, "Basic risk checks failed", {}
+                    
+                    # Calculate position value safely
+                    position_value = safe_quantity * safe_price
+                    
+                    # Comprehensive risk checks
+                    checks = [
+                        ("rate_limits", self._check_rate_limits()),
+                        ("cooldown", self._check_cooldown(symbol)),
+                        ("position_size", self._check_position_size(symbol, position_value)),
+                        ("total_exposure", self._check_total_exposure(position_value)),
+                        ("leverage", self._check_leverage(position_value))
+                    ]
+                    
+                    # Async checks
+                    correlation_check = await self._check_correlation_limits(symbol)
+                    checks.append(("correlation", correlation_check))
+                    
+                    # Process all checks
+                    for check_name, (passed, reason) in checks:
+                        if not passed:
+                            increment_counter(RISK_VIOLATIONS, violation_type=check_name)
+                            logger.warning(f"Risk check failed: {check_name}", 
+                                         reason=reason, symbol=symbol)
+                            return False, reason, {}
+                    
+                    # Calculate risk metrics
+                    risk_metrics = self._calculate_risk_metrics(symbol, position_value)
+                    
+                    logger.debug(f"Order risk check passed for {symbol}", **risk_metrics)
+                    return True, None, risk_metrics
                 if not leverage_check[0]:
                     return False, leverage_check[1], {}
                 

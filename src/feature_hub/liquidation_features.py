@@ -17,6 +17,12 @@ import numpy as np
 
 from ..common.config import settings
 from ..common.logging import get_logger
+from ..common.decorators import profile_performance, with_error_handling
+from ..common.error_handler import error_context
+from ..common.exceptions import FeatureEngineError, TradingBotError
+from ..common.performance import performance_context, MemoryOptimizer
+from ..common.types import Symbol, FeatureDict
+from ..common.utils import safe_float, safe_int, get_utc_timestamp, clamp
 
 logger = get_logger(__name__)
 
@@ -39,7 +45,7 @@ class LiquidationFeatureEngine:
         Args:
             max_history: Maximum liquidation events to keep per symbol
         """
-        self.max_history = max_history
+        self.max_history = safe_int(max_history, 1800)
         
         # Per-symbol liquidation data
         self.liquidation_events: Dict[str, deque] = defaultdict(lambda: deque(maxlen=self.max_history))
@@ -76,7 +82,9 @@ class LiquidationFeatureEngine:
         self.asymmetry_metrics: Dict[str, deque] = defaultdict(lambda: deque(maxlen=300))
         self.cluster_analysis: Dict[str, Dict[str, Any]] = defaultdict(dict)
     
-    def process_liquidation(self, symbol: str, data: Dict[str, Any]) -> Dict[str, float]:
+    @profile_performance(include_memory=True)
+    @with_error_handling(FeatureEngineError)
+    def process_liquidation(self, symbol: Symbol, data: Dict[str, Any]) -> FeatureDict:
         """
         Process liquidation event and compute advanced features.
         
@@ -87,82 +95,88 @@ class LiquidationFeatureEngine:
         Returns:
             Dictionary of computed features
         """
-        try:
-            current_time = time.time()
+        with performance_context(f"liquidation_processing_{symbol}"):
+            current_time = get_utc_timestamp() / 1000.0  # Convert to seconds
             
             # Rate limiting
             if current_time - self.last_update[symbol] < self.min_update_interval:
                 return self.latest_features[symbol]
             
-            # Extract liquidation data
+            # Extract liquidation data with safe conversions
             liquidation = {
-                "timestamp": data.get("timestamp", current_time),
+                "timestamp": safe_float(data.get("timestamp", current_time)),
                 "symbol": symbol,
                 "side": data.get("side", ""),
-                "size": float(data.get("size", 0)),
-                "price": float(data.get("price", 0)),
-                "liquidation_time": data.get("liquidation_time", current_time),
+                "size": safe_float(data.get("size", 0)),
+                "price": safe_float(data.get("price", 0)),
+                "liquidation_time": safe_float(data.get("liquidation_time", current_time)),
                 "spike_detected": data.get("spike_detected", False),
-                "spike_severity": float(data.get("spike_severity", 0)),
+                "spike_severity": safe_float(data.get("spike_severity", 0)),
                 "spike_type": data.get("spike_type", ""),
                 "liq_metrics": data.get("liq_metrics", {})
             }
             
+            # Validate critical data
             if liquidation["size"] <= 0 or liquidation["price"] <= 0:
+                logger.debug(f"Invalid liquidation data for {symbol}: size={liquidation['size']}, price={liquidation['price']}")
                 return {}
             
-            # Store liquidation event
-            self.liquidation_events[symbol].append(liquidation)
-            
-            # Update volume windows
-            self._update_volume_windows(symbol, liquidation)
-            
-            # Update size percentiles periodically
-            self._update_size_percentiles(symbol, current_time)
-            
-            # Compute advanced features
-            features = {}
-            
-            # 1. Enhanced cascade analysis
-            features.update(self._compute_cascade_features(symbol, liquidation))
-            
-            # 2. Directional pressure analysis
-            features.update(self._compute_directional_features(symbol))
-            
-            # 3. Market structure breakdown detection
-            features.update(self._compute_structure_features(symbol, liquidation))
-            
-            # 4. Cross-timeframe analysis
-            features.update(self._compute_timeframe_features(symbol))
-            
-            # 5. Size-based segmentation
-            features.update(self._compute_size_features(symbol, liquidation))
-            
-            # 6. Price impact correlation
-            features.update(self._compute_price_correlation_features(symbol, liquidation))
-            
-            # 7. Cross-symbol spillover (if multiple symbols tracked)
-            if len(self.liquidation_events) > 1:
-                features.update(self._compute_spillover_features(symbol, liquidation))
-            
-            # 8. Advanced size distribution analysis
-            features.update(self._compute_size_distribution_features(symbol))
-            
-            # 9. Long/short asymmetry analysis
-            features.update(self._compute_asymmetry_features(symbol))
-            
-            # 10. Liquidation clustering analysis
-            features.update(self._compute_clustering_features(symbol))
-            
-            # Cache results
-            self.latest_features[symbol] = features
-            self.last_update[symbol] = current_time
-            
-            return features
-            
-        except Exception as e:
-            logger.warning(f"Error computing liquidation features for {symbol}", exception=e)
-            return {}
+            with error_context({"symbol": symbol, "liquidation": liquidation}):
+                # Store liquidation event
+                self.liquidation_events[symbol].append(liquidation)
+                
+                # Update volume windows
+                self._update_volume_windows(symbol, liquidation)
+                
+                # Update size percentiles periodically
+                self._update_size_percentiles(symbol, current_time)
+                
+                # Compute advanced features
+                features = {}
+                
+                # 1. Enhanced cascade analysis
+                features.update(self._compute_cascade_features(symbol, liquidation))
+                
+                # 2. Directional pressure analysis
+                features.update(self._compute_directional_features(symbol))
+                
+                # 3. Market structure breakdown detection
+                features.update(self._compute_structure_features(symbol, liquidation))
+                
+                # 4. Cross-timeframe analysis
+                features.update(self._compute_timeframe_features(symbol))
+                
+                # 5. Size-based segmentation
+                features.update(self._compute_size_features(symbol, liquidation))
+                
+                # 6. Price impact correlation
+                features.update(self._compute_price_correlation_features(symbol, liquidation))
+                
+                # 7. Cross-symbol spillover (if multiple symbols tracked)
+                if len(self.liquidation_events) > 1:
+                    features.update(self._compute_spillover_features(symbol, liquidation))
+                
+                # 8. Advanced size distribution analysis
+                features.update(self._compute_size_distribution_features(symbol))
+                
+                # 9. Long/short asymmetry analysis
+                features.update(self._compute_asymmetry_features(symbol))
+                
+                # 10. Liquidation clustering analysis
+                features.update(self._compute_clustering_features(symbol))
+                
+                # Validate and clamp feature values
+                features = self._validate_features(features)
+                
+                # Cache results
+                self.latest_features[symbol] = features
+                self.last_update[symbol] = current_time
+                
+                # Periodic memory optimization
+                if len(self.liquidation_events) % 100 == 0:
+                    MemoryOptimizer.optimize_memory()
+                
+                return features
     
     def _update_volume_windows(self, symbol: str, liquidation: Dict[str, Any]) -> None:
         """Update rolling volume windows efficiently."""
@@ -178,105 +192,168 @@ class LiquidationFeatureEngine:
                 "price": liquidation["price"]
             })
     
-    def _update_size_percentiles(self, symbol: str, current_time: float) -> None:
+    def _update_size_percentiles(self, symbol: Symbol, current_time: float) -> None:
         """Update size percentiles for threshold analysis."""
         if current_time - self.last_percentile_update[symbol] < self.update_percentiles_interval:
             return
         
-        events = list(self.liquidation_events[symbol])
-        if len(events) < 50:  # Need minimum data
-            return
-        
-        sizes = [event["size"] for event in events[-500:]]  # Last 500 events
-        size_array = np.array(sizes, dtype=np.float32)
-        
-        self.size_percentiles[symbol] = {
-            "p50": float(np.percentile(size_array, 50)),
-            "p75": float(np.percentile(size_array, 75)),
-            "p90": float(np.percentile(size_array, 90)),
-            "p95": float(np.percentile(size_array, 95)),
-            "p99": float(np.percentile(size_array, 99)),
-        }
-        
-        self.last_percentile_update[symbol] = current_time
+        with error_context({"symbol": symbol, "operation": "update_size_percentiles"}):
+            events = list(self.liquidation_events[symbol])
+            if len(events) < 50:  # Need minimum data
+                return
+            
+            # Use safe conversion and limit data for memory efficiency
+            sizes = [safe_float(event["size"]) for event in events[-500:]]  # Last 500 events
+            sizes = [s for s in sizes if s > 0]  # Filter out invalid sizes
+            
+            if len(sizes) < 10:
+                return
+            
+            size_array = np.array(sizes, dtype=np.float32)
+            
+            try:
+                self.size_percentiles[symbol] = {
+                    "p50": float(np.percentile(size_array, 50)),
+                    "p75": float(np.percentile(size_array, 75)),
+                    "p90": float(np.percentile(size_array, 90)),
+                    "p95": float(np.percentile(size_array, 95)),
+                    "p99": float(np.percentile(size_array, 99)),
+                }
+                
+                self.last_percentile_update[symbol] = current_time
+                
+            except Exception as e:
+                logger.warning(f"Failed to compute percentiles for {symbol}", exception=e)
+                # Keep existing percentiles if calculation fails
     
-    def _compute_cascade_features(self, symbol: str, current_liq: Dict[str, Any]) -> Dict[str, float]:
+    def _compute_cascade_features(self, symbol: Symbol, current_liq: Dict[str, Any]) -> FeatureDict:
         """Compute liquidation cascade analysis features."""
         features = {}
         
-        try:
+        with error_context({"symbol": symbol, "operation": "compute_cascade_features"}):
             events = list(self.liquidation_events[symbol])
             if len(events) < 5:
                 return features
             
-            current_time = current_liq["timestamp"]
+            current_time = safe_float(current_liq["timestamp"])
             
             # Define cascade time windows
             cascade_windows = [5, 15, 30, 60]  # seconds
             
             for window_sec in cascade_windows:
                 window_start = current_time - window_sec
-                window_events = [e for e in events if e["timestamp"] >= window_start]
+                window_events = [e for e in events if safe_float(e["timestamp"]) >= window_start]
                 
                 if not window_events:
                     continue
                 
-                # Cascade intensity metrics
-                total_volume = sum(e["size"] for e in window_events)
+                # Cascade intensity metrics with safe calculations
+                sizes = [safe_float(e["size"]) for e in window_events]
+                total_volume = sum(sizes)
                 event_count = len(window_events)
                 
                 features[f"cascade_volume_{window_sec}s"] = total_volume
                 features[f"cascade_count_{window_sec}s"] = event_count
-                features[f"cascade_intensity_{window_sec}s"] = total_volume / window_sec  # Volume per second
+                features[f"cascade_intensity_{window_sec}s"] = total_volume / window_sec if window_sec > 0 else 0
                 
                 # Cascade acceleration (recent vs earlier events)
                 if window_sec >= 30 and len(window_events) >= 4:
                     half_window = window_sec // 2
                     mid_time = current_time - half_window
                     
-                    recent_events = [e for e in window_events if e["timestamp"] >= mid_time]
-                    earlier_events = [e for e in window_events if e["timestamp"] < mid_time]
+                    recent_events = [e for e in window_events if safe_float(e["timestamp"]) >= mid_time]
+                    earlier_events = [e for e in window_events if safe_float(e["timestamp"]) < mid_time]
                     
                     if recent_events and earlier_events:
-                        recent_volume = sum(e["size"] for e in recent_events)
-                        earlier_volume = sum(e["size"] for e in earlier_events)
+                        recent_volume = sum(safe_float(e["size"]) for e in recent_events)
+                        earlier_volume = sum(safe_float(e["size"]) for e in earlier_events)
                         
                         # Normalize by time period
-                        recent_rate = recent_volume / half_window
-                        earlier_rate = earlier_volume / half_window
+                        recent_rate = recent_volume / half_window if half_window > 0 else 0
+                        earlier_rate = earlier_volume / half_window if half_window > 0 else 0
                         
                         if earlier_rate > 0:
-                            features[f"cascade_acceleration_{window_sec}s"] = recent_rate / earlier_rate
+                            acceleration = recent_rate / earlier_rate
+                            features[f"cascade_acceleration_{window_sec}s"] = clamp(acceleration, 0, 10)
                 
                 # Side-specific cascade analysis
-                buy_liquidations = [e for e in window_events if e["side"].lower() == "buy"]
-                sell_liquidations = [e for e in window_events if e["side"].lower() == "sell"]
+                buy_liquidations = [e for e in window_events if str(e.get("side", "")).lower() == "buy"]
+                sell_liquidations = [e for e in window_events if str(e.get("side", "")).lower() == "sell"]
                 
-                buy_volume = sum(e["size"] for e in buy_liquidations)
-                sell_volume = sum(e["size"] for e in sell_liquidations)
+                buy_volume = sum(safe_float(e["size"]) for e in buy_liquidations)
+                sell_volume = sum(safe_float(e["size"]) for e in sell_liquidations)
                 total_volume = buy_volume + sell_volume
                 
                 if total_volume > 0:
                     features[f"cascade_sell_ratio_{window_sec}s"] = sell_volume / total_volume
-                    features[f"cascade_directional_imbalance_{window_sec}s"] = (sell_volume - buy_volume) / total_volume
+                    imbalance = (sell_volume - buy_volume) / total_volume
+                    features[f"cascade_directional_imbalance_{window_sec}s"] = clamp(imbalance, -1, 1)
                 
                 # Price range during cascade
                 if window_events:
-                    prices = [e["price"] for e in window_events]
-                    price_range = max(prices) - min(prices)
-                    avg_price = sum(prices) / len(prices)
-                    features[f"cascade_price_range_{window_sec}s"] = price_range / avg_price if avg_price > 0 else 0
+                    prices = [safe_float(e["price"]) for e in window_events if safe_float(e["price"]) > 0]
+                    if prices:
+                        price_range = max(prices) - min(prices)
+                        avg_price = sum(prices) / len(prices)
+                        range_ratio = price_range / avg_price if avg_price > 0 else 0
+                        features[f"cascade_price_range_{window_sec}s"] = clamp(range_ratio, 0, 1)
             
             # Multi-timeframe cascade correlation
             if "cascade_volume_5s" in features and "cascade_volume_60s" in features:
                 vol_5s = features["cascade_volume_5s"]
                 vol_60s = features["cascade_volume_60s"]
-                features["cascade_concentration"] = vol_5s / vol_60s if vol_60s > 0 else 0
-        
-        except Exception as e:
-            logger.warning(f"Error computing cascade features for {symbol}", exception=e)
+                concentration = vol_5s / vol_60s if vol_60s > 0 else 0
+                features["cascade_concentration"] = clamp(concentration, 0, 1)
         
         return features
+    
+    def _validate_features(self, features: FeatureDict) -> FeatureDict:
+        """
+        Validate and sanitize feature values.
+        
+        Args:
+            features: Raw feature dictionary
+            
+        Returns:
+            Validated feature dictionary
+        """
+        validated = {}
+        
+        for key, value in features.items():
+            # Convert to safe float
+            safe_value = safe_float(value)
+            
+            # Check for invalid values
+            if np.isnan(safe_value) or np.isinf(safe_value):
+                logger.debug(f"Invalid feature value for {key}: {value}")
+                safe_value = 0.0
+            
+            # Clamp extreme values
+            safe_value = clamp(safe_value, -1000, 1000)
+            
+            validated[key] = safe_value
+        
+        return validated
+    
+    def get_feature_statistics(self) -> Dict[str, Any]:
+        """Get statistics about computed features."""
+        stats = {
+            "total_symbols": len(self.liquidation_events),
+            "total_events": sum(len(events) for events in self.liquidation_events.values()),
+            "feature_counts": {},
+            "memory_usage": {}
+        }
+        
+        for symbol, features in self.latest_features.items():
+            stats["feature_counts"][symbol] = len(features)
+        
+        # Memory usage estimation
+        for symbol in self.liquidation_events:
+            event_count = len(self.liquidation_events[symbol])
+            estimated_bytes = event_count * 200  # Rough estimate per event
+            stats["memory_usage"][symbol] = f"{estimated_bytes / 1024:.1f} KB"
+        
+        return stats
     
     def _compute_directional_features(self, symbol: str) -> Dict[str, float]:
         """Compute directional liquidation pressure features."""

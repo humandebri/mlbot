@@ -14,6 +14,10 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidURI
 
 from .config import settings
+from .config_manager import ConfigManager
+from .decorators import profile_performance, with_error_handling, retry_with_backoff
+from .error_handler import error_context, error_handler
+from .exceptions import APIError, ConnectionError, TradingBotError
 from .logging import get_logger
 from .monitoring import (
     ERRORS_TOTAL,
@@ -23,6 +27,9 @@ from .monitoring import (
     increment_counter,
     set_gauge,
 )
+from .performance import performance_context
+from .types import Symbol
+from .utils import safe_float, safe_int, get_utc_timestamp, normalize_symbol
 
 logger = get_logger(__name__)
 
@@ -40,13 +47,14 @@ class BybitWebSocketClient:
     
     def __init__(
         self,
-        symbols: List[str],
-        on_message: Callable[[str, Dict[str, Any]], None],
-        testnet: bool = True,
+        symbols: List[Symbol],
+        on_message: Callable[[Symbol, Dict[str, Any]], None],
+        testnet: Optional[bool] = None,
     ):
-        self.symbols = symbols
+        self.config = ConfigManager().get_config()
+        self.symbols = [normalize_symbol(s) for s in symbols]
         self.on_message = on_message
-        self.testnet = testnet
+        self.testnet = testnet if testnet is not None else self.config.bybit.testnet
         
         # Connection management
         self.websocket: Optional[websockets.WebSocketServerProtocol] = None
@@ -65,38 +73,55 @@ class BybitWebSocketClient:
         
         # URLs
         self.ws_url = (
-            settings.bybit.testnet_ws_url if testnet 
-            else settings.bybit.ws_url
+            self.config.bybit.testnet_ws_url if self.testnet 
+            else self.config.bybit.ws_url
         )
     
+    @profile_performance()
     async def start(self) -> None:
         """Start the WebSocket connection with retry logic."""
-        self.running = True
-        logger.info(
-            "Starting Bybit WebSocket client",
-            symbols=self.symbols,
-            testnet=self.testnet,
-            url=self.ws_url
-        )
-        
-        while self.running:
-            try:
-                await self._connect_and_run()
-            except Exception as e:
-                logger.error("WebSocket connection failed", exception=e)
-                increment_counter(ERRORS_TOTAL, component="websocket", error_type=type(e).__name__)
-                
-                if self.running:
-                    self.reconnect_count += 1
-                    increment_counter(WEBSOCKET_RECONNECTS, symbol="all")
+        with performance_context("websocket_start"):
+            self.running = True
+            logger.info(
+                "Starting Bybit WebSocket client",
+                symbols=self.symbols,
+                testnet=self.testnet,
+                url=self.ws_url
+            )
+            
+            while self.running:
+                with error_context({"symbols": self.symbols, "attempt": self.reconnect_count}):
+                    try:
+                        await self._connect_and_run()
+                    except (ConnectionClosed, InvalidURI) as e:
+                        logger.warning(f"WebSocket connection error: {e}")
+                        error_handler.handle_error(ConnectionError(str(e)), {
+                            "url": self.ws_url,
+                            "symbols": self.symbols
+                        })
+                    except Exception as e:
+                        logger.error("WebSocket connection failed", exception=e)
+                        increment_counter(ERRORS_TOTAL, component="websocket", error_type=type(e).__name__)
+                        
+                        error_handler.handle_error(e, {
+                            "operation": "websocket_connection",
+                            "url": self.ws_url,
+                            "symbols": self.symbols
+                        })
                     
-                    if self.reconnect_count > settings.bybit.max_reconnect_attempts:
-                        logger.error("Max reconnect attempts reached, stopping")
-                        break
-                    
-                    wait_time = min(settings.bybit.reconnect_delay * self.reconnect_count, 60)
-                    logger.info(f"Reconnecting in {wait_time}s (attempt {self.reconnect_count})")
-                    await asyncio.sleep(wait_time)
+                    if self.running:
+                        self.reconnect_count += 1
+                        increment_counter(WEBSOCKET_RECONNECTS, symbol="all")
+                        
+                        max_attempts = self.config.bybit.max_reconnect_attempts
+                        if self.reconnect_count > max_attempts:
+                            logger.error(f"Max reconnect attempts ({max_attempts}) reached, stopping")
+                            break
+                        
+                        reconnect_delay = self.config.bybit.reconnect_delay
+                        wait_time = min(reconnect_delay * self.reconnect_count, 60)
+                        logger.info(f"Reconnecting in {wait_time}s (attempt {self.reconnect_count})")
+                        await asyncio.sleep(wait_time)
     
     async def stop(self) -> None:
         """Stop the WebSocket connection gracefully."""
@@ -111,22 +136,27 @@ class BybitWebSocketClient:
         for symbol in self.symbols:
             set_gauge(WEBSOCKET_CONNECTIONS, 0, symbol=symbol)
     
+    @retry_with_backoff(max_attempts=3)
     async def _connect_and_run(self) -> None:
         """Establish connection and run message processing loop."""
-        try:
-            # Connect with optimized settings
-            self.websocket = await asyncio.wait_for(
-                websockets.connect(
-                    self.ws_url,
-                    ping_interval=settings.bybit.ping_interval,
-                    ping_timeout=30,
-                    max_size=1024 * 1024 * 10,  # 10MB max message size
-                    compression=None,  # Disable compression for speed
-                    close_timeout=10,
-                    open_timeout=30,
-                ),
-                timeout=60  # 60 second connection timeout
-            )
+        with performance_context("websocket_connect_and_run"):
+            try:
+                # Connect with optimized settings
+                ping_interval = self.config.bybit.ping_interval
+                connection_timeout = safe_int(self.config.bybit.connection_timeout, 60)
+                
+                self.websocket = await asyncio.wait_for(
+                    websockets.connect(
+                        self.ws_url,
+                        ping_interval=ping_interval,
+                        ping_timeout=30,
+                        max_size=1024 * 1024 * 10,  # 10MB max message size
+                        compression=None,  # Disable compression for speed
+                        close_timeout=10,
+                        open_timeout=30,
+                    ),
+                    timeout=connection_timeout
+                )
             
             logger.info("WebSocket connected successfully")
             self.reconnect_count = 0
