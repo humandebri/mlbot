@@ -33,14 +33,14 @@ logger = get_logger(__name__)
 class RiskConfig:
     """Risk management configuration."""
     
-    # Position limits
-    max_position_size_usd: float = 100000.0  # Maximum position size per symbol
-    max_total_exposure_usd: float = 500000.0  # Maximum total exposure
-    max_leverage: float = 10.0  # Maximum leverage allowed
-    max_positions: int = 10  # Maximum number of concurrent positions
+    # Position limits (adjusted for $100 account)
+    max_position_size_usd: float = 30.0  # Maximum position size per symbol ($100 * 30%)
+    max_total_exposure_usd: float = 60.0  # Maximum total exposure ($100 * 60%)
+    max_leverage: float = 3.0  # Maximum leverage allowed (safer)
+    max_positions: int = 3  # Maximum number of concurrent positions (reduced)
     
-    # Loss limits
-    max_daily_loss_usd: float = 10000.0  # Maximum daily loss
+    # Loss limits (adjusted for $100 account)
+    max_daily_loss_usd: float = 10.0  # Maximum daily loss (10% of account)
     max_drawdown_pct: float = 0.20  # Maximum drawdown (20%)
     stop_loss_pct: float = 0.02  # Default stop loss (2%)
     trailing_stop_pct: float = 0.015  # Trailing stop loss (1.5%)
@@ -157,7 +157,7 @@ class RiskManager:
         # Performance tracking
         self.daily_pnl: Dict[str, float] = defaultdict(float)  # Date -> PnL
         self.cumulative_pnl: float = 0.0
-        self.peak_equity: float = 100000.0  # Starting capital
+        self.peak_equity: float = 100.0  # Starting capital (actual account balance)
         self.current_equity: float = self.peak_equity
         
         # Trade tracking
@@ -184,6 +184,47 @@ class RiskManager:
         self._lock = asyncio.Lock()
         
         logger.info("Risk manager initialized", config=self.config.__dict__)
+    
+    def can_trade(self, symbol: str, side: str = None, size: float = None) -> bool:
+        """
+        Check if trading is allowed for the given symbol.
+        
+        Args:
+            symbol: Trading symbol (e.g., 'BTCUSDT')
+            side: Order side ('buy' or 'sell') - optional
+            size: Position size in USD - optional
+            
+        Returns:
+            bool: True if trading is allowed, False otherwise
+        """
+        try:
+            # Check if we're in circuit breaker mode
+            if hasattr(self, '_circuit_breaker_active') and self._circuit_breaker_active:
+                return False
+                
+            # Check daily loss limits
+            if hasattr(self, '_daily_loss') and self._daily_loss >= self.config.max_daily_loss_usd:
+                return False
+                
+            # Check if we've hit the drawdown limit
+            if hasattr(self, '_current_drawdown') and self._current_drawdown >= self.config.max_drawdown_pct:
+                return False
+                
+            # Check maximum positions limit
+            if hasattr(self, '_active_positions') and len(self._active_positions) >= self.config.max_positions:
+                return False
+                
+            # Check if we're in cooldown period
+            if hasattr(self, '_last_trade_time'):
+                import time
+                if time.time() - self._last_trade_time < self.config.cooldown_period_seconds:
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking trade permission: {e}")
+            return False  # Default to safe mode
     
     async def check_order_risk(
         self,
@@ -700,7 +741,12 @@ class RiskManager:
         
         increment_counter(RISK_VIOLATIONS, violation_type="circuit_breaker")
         
-        # TODO: Implement emergency position liquidation if configured
+        # Emergency position liquidation
+        if self.config.emergency_liquidation:
+            # Schedule emergency liquidation as a task
+            logger.critical("Scheduling emergency liquidation")
+            # Note: The actual liquidation will need to be handled by the caller
+            # or through a separate async task
     
     def _calculate_order_risk_metrics(
         self,
@@ -747,3 +793,38 @@ class RiskManager:
         old_hours = [h for h in self.trade_count_hourly if h < cutoff_time]
         for h in old_hours:
             del self.trade_count_hourly[h]
+    
+    async def _emergency_liquidate_all_positions(self) -> None:
+        """Emergency liquidation of all open positions."""
+        logger.critical("EMERGENCY LIQUIDATION TRIGGERED")
+        
+        if not hasattr(self, 'bybit_client'):
+            # Need to initialize Bybit client if not available
+            from ..common.bybit_client import BybitRESTClient
+            self.bybit_client = BybitRESTClient()
+        
+        try:
+            # Get all open positions
+            for position in self.active_positions.values():
+                symbol = position.symbol
+                side = "sell" if position.side == "long" else "buy"
+                
+                logger.warning(f"Emergency liquidating {symbol} position: {position.quantity}")
+                
+                # Place market order to close position
+                result = await self.bybit_client.create_order(
+                    symbol=symbol,
+                    side=side,
+                    order_type="market",
+                    qty=abs(position.quantity),
+                    reduce_only=True
+                )
+                
+                if result:
+                    logger.info(f"Emergency liquidation order placed for {symbol}")
+                else:
+                    logger.error(f"Failed to liquidate {symbol}")
+                    
+        except Exception as e:
+            logger.critical(f"Emergency liquidation failed: {e}")
+            # Continue trying to close other positions

@@ -458,6 +458,52 @@ class BybitRESTClient:
             increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
             return {}
     
+    async def get_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get ticker data for a symbol."""
+        cache_key = f"ticker:{symbol}"
+        
+        # Check cache first
+        if self._is_cache_valid(cache_key):
+            return self.cache[cache_key]["data"]
+        
+        try:
+            async with self.request_semaphore:
+                await self._wait_for_rate_limit()
+                
+                url = urljoin(self.base_url, "/v5/market/tickers")
+                params = {
+                    "category": "linear",
+                    "symbol": symbol
+                }
+                
+                if not self.session:
+                    self.session = aiohttp.ClientSession()
+                
+                async with self.session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("retCode") == 0 and data.get("result", {}).get("list"):
+                            ticker_data = data["result"]["list"][0]
+                            
+                            # Cache the result
+                            self.cache[cache_key] = {
+                                "data": ticker_data,
+                                "timestamp": time.time()
+                            }
+                            
+                            return ticker_data
+                        else:
+                            logger.warning(f"No ticker data for {symbol}")
+                            return None
+                    else:
+                        logger.error(f"Ticker API error: {response.status}")
+                        return None
+        
+        except Exception as e:
+            logger.error(f"Error fetching ticker for {symbol}", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+            return None
+    
     def _is_cache_valid(self, key: str) -> bool:
         """Check if cached data is still valid."""
         if key not in self.cache:
@@ -596,6 +642,40 @@ class BybitRESTClient:
         
         return None
     
+    async def get_order_status(self, symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
+        """Get order status."""
+        try:
+            async with self.request_semaphore:
+                await self._wait_for_rate_limit()
+                
+                url = urljoin(self.base_url, "/v5/order/realtime")
+                params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "orderId": order_id
+                }
+                
+                headers = self._get_auth_headers("GET", "/v5/order/realtime", params)
+                
+                if not self.session:
+                    self.session = aiohttp.ClientSession()
+                
+                async with self.session.get(url, params=params, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("retCode") == 0 and data.get("result", {}).get("list"):
+                            return data["result"]["list"][0]
+                        else:
+                            logger.warning(f"No order found: {order_id}")
+                    else:
+                        logger.error(f"HTTP error {response.status} getting order status")
+                        
+        except Exception as e:
+            logger.error("Error getting order status", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+        
+        return None
+    
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         """Cancel an order."""
         try:
@@ -725,6 +805,42 @@ class BybitRESTClient:
                         
         except Exception as e:
             logger.error("Error setting take profit", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+        
+        return False
+    
+    async def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """Set leverage for a symbol."""
+        try:
+            async with self.request_semaphore:
+                await self._wait_for_rate_limit()
+                
+                url = urljoin(self.base_url, "/v5/position/set-leverage")
+                params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "buyLeverage": str(leverage),
+                    "sellLeverage": str(leverage)
+                }
+                
+                headers = self._get_auth_headers("POST", "/v5/position/set-leverage", params)
+                
+                if not self.session:
+                    self.session = aiohttp.ClientSession()
+                
+                async with self.session.post(url, json=params, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("retCode") == 0:
+                            logger.info(f"Leverage set for {symbol}: {leverage}x")
+                            return True
+                        else:
+                            logger.error(f"API error setting leverage: {data.get('retMsg')}")
+                    else:
+                        logger.error(f"HTTP error {response.status} setting leverage")
+                        
+        except Exception as e:
+            logger.error("Error setting leverage", exception=e)
             increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
         
         return False

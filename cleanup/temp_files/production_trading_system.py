@@ -16,6 +16,7 @@ load_dotenv(env_path)
 import asyncio
 import signal
 import sys
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any
@@ -62,6 +63,10 @@ class ProductionTradingSystem:
         # Initialize Account Monitor with 60 second interval
         self.account_monitor = AccountMonitor(check_interval=60)
         
+        # Signal cooldown tracking to prevent spam
+        self.last_signal_time = {}  # {symbol: timestamp}
+        self.signal_cooldown = 300  # 5 minutes between signals for same symbol
+        
         # Initialize Order Executor for actual trading
         self.order_executor = OrderExecutor(self.bybit_client)
         
@@ -95,6 +100,18 @@ class ProductionTradingSystem:
             # Create trading tables
             create_trading_tables()
             logger.info("Trading tables initialized")
+            
+            # Set leverage for all trading symbols
+            leverage = 3  # 3x leverage as configured
+            for symbol in settings.bybit.symbols:
+                try:
+                    leverage_set = await self.bybit_client.set_leverage(symbol, leverage)
+                    if leverage_set:
+                        logger.info(f"Leverage set to {leverage}x for {symbol}")
+                    else:
+                        logger.error(f"Failed to set leverage for {symbol}")
+                except Exception as e:
+                    logger.error(f"Error setting leverage for {symbol}: {e}")
             
             # Load ML model
             self.inference_engine.load_model()
@@ -371,6 +388,18 @@ class ProductionTradingSystem:
                                 logger.info(f"Prediction {symbol}: pred={prediction:.4f}, conf={confidence:.2%}")
                             
                             if confidence > 0.6:
+                                # Check signal cooldown to prevent spam
+                                current_time = time.time()
+                                if symbol in self.last_signal_time:
+                                    time_since_last = current_time - self.last_signal_time[symbol]
+                                    if time_since_last < self.signal_cooldown:
+                                        if loop_count % 30 == 0:  # Log cooldown status occasionally
+                                            logger.info(f"⏳ Signal cooldown for {symbol}: {self.signal_cooldown - time_since_last:.0f}s remaining")
+                                        continue
+                                
+                                # Update last signal time
+                                self.last_signal_time[symbol] = current_time
+                                
                                 # Get current balance for position sizing
                                 position_size = 0
                                 if self.account_monitor.current_balance:
@@ -384,10 +413,14 @@ class ProductionTradingSystem:
                                     )
                                     
                                     # Send Discord notification with real balance info
+                                    # Get current market price for notification
+                                    ticker = await self.bybit_client.get_ticker(symbol)
+                                    display_price = float(ticker['lastPrice']) if ticker and 'lastPrice' in ticker else features.get('close', 0)
+                                    
                                     fields = {
                                         "Symbol": symbol,
                                         "Side": "BUY" if prediction > 0 else "SELL",
-                                        "Price": f"${features.get('close', 50000):,.2f}",
+                                        "Price": f"${display_price:,.2f}",
                                         "Confidence": f"{confidence:.2%}",
                                         "Expected PnL": f"{prediction:.2%}",
                                         "Account Balance": f"${self.account_monitor.current_balance.total_equity:,.2f}",
@@ -411,7 +444,17 @@ class ProductionTradingSystem:
                                             size=position_size
                                         ):
                                             # 取引価格の決定（スリッページ考慮）
-                                            current_price = features.get('close', 50000)
+                                            # 実際の市場価格を取得
+                                            ticker = await self.bybit_client.get_ticker(symbol)
+                                            if ticker and 'lastPrice' in ticker:
+                                                current_price = float(ticker['lastPrice'])
+                                            else:
+                                                # 特徴量から価格を取得（フォールバック）
+                                                current_price = features.get('close', 0)
+                                                if current_price == 0:
+                                                    logger.error(f"Failed to get price for {symbol}")
+                                                    continue
+                                            
                                             slippage = 0.001  # 0.1%
                                             
                                             if prediction > 0:  # Buy
@@ -432,12 +475,38 @@ class ProductionTradingSystem:
                                                 stop_loss_price = current_price * (1 + stop_loss_pct)
                                                 take_profit_price = current_price * (1 - take_profit_pct)
                                             
+                                            # 最小注文サイズチェック
+                                            min_order_size_usd = 10.0  # Bybit minimum
+                                            if position_size < min_order_size_usd:
+                                                logger.warning(f"Position size ${position_size:.2f} is below minimum ${min_order_size_usd}")
+                                                # Discord通知で警告
+                                                discord_notifier.send_notification(
+                                                    title="⚠️ 注文サイズ警告",
+                                                    description=f"{symbol}: ポジションサイズが最小注文サイズ未満です",
+                                                    color="ff9900",
+                                                    fields={
+                                                        "Position Size": f"${position_size:.2f}",
+                                                        "Minimum Required": f"${min_order_size_usd:.2f}",
+                                                        "Action": "注文をスキップしました"
+                                                    }
+                                                )
+                                                continue
+                                            
+                                            # 注文数量の計算と精度チェック
+                                            order_qty = position_size / current_price
+                                            
+                                            # BTCの場合は小数点3桁、その他は小数点2桁に丸める
+                                            if "BTC" in symbol:
+                                                order_qty = round(order_qty, 3)
+                                            else:
+                                                order_qty = round(order_qty, 2)
+                                            
                                             # 注文実行（新しいcreate_orderメソッドを使用）
                                             order_result = await self.bybit_client.create_order(
                                                 symbol=symbol,
                                                 side=order_side,
                                                 order_type="limit",
-                                                qty=position_size / current_price,  # USD to quantity
+                                                qty=order_qty,  # 精度調整済み
                                                 price=order_price,
                                                 stop_loss=stop_loss_price,
                                                 take_profit=take_profit_price

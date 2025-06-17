@@ -124,7 +124,7 @@ class ExecutionConfig:
     # Smart routing
     use_post_only: bool = True  # Use post-only orders when possible
     split_large_orders: bool = True  # Split large orders
-    max_order_size_usd: float = 50000.0  # Maximum single order size
+    max_order_size_usd: float = 30.0  # Maximum single order size (adjusted for $100 account)
     
     # Fill improvement
     price_improvement_check: bool = True  # Check for better prices

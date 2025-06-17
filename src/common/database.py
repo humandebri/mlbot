@@ -563,6 +563,47 @@ class RedisManager:
         self.redis = await get_redis_client()
         logger.info("RedisManager connected to Redis")
     
+    async def get(self, key: str) -> Optional[str]:
+        """Get value from Redis."""
+        if not self.redis:
+            return None
+        try:
+            return await self.redis.get(key)
+        except Exception as e:
+            logger.error(f"Redis get error: {e}")
+            return None
+    
+    async def xread(self, streams: Dict[str, str], count: int = None, block: int = None) -> List:
+        """Read from Redis streams."""
+        if not self.redis:
+            return []
+        try:
+            return await self.redis.xread(streams, count=count, block=block)
+        except Exception as e:
+            logger.error(f"Redis xread error: {e}")
+            return []
+    
+    async def xrevrange(self, stream: str, start: str = "+", end: str = "-", count: int = None) -> List:
+        """Read from Redis stream in reverse order."""
+        if not self.redis:
+            return []
+        try:
+            return await self.redis.xrevrange(stream, start, end, count=count)
+        except Exception as e:
+            logger.error(f"Redis xrevrange error: {e}")
+            return []
+    
+    async def ping(self) -> bool:
+        """Ping Redis to check connection."""
+        if not self.redis:
+            return False
+        try:
+            await self.redis.ping()
+            return True
+        except Exception as e:
+            logger.error(f"Redis ping error: {e}")
+            return False
+    
     async def close(self) -> None:
         """Close Redis connection."""
         if self.redis:

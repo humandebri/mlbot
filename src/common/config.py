@@ -15,9 +15,9 @@ class BybitConfig(BaseModel):
     ws_url: str = "wss://stream.bybit.com/v5/public/linear"
     testnet_ws_url: str = "wss://stream-testnet.bybit.com/v5/public/linear"
     
-    api_key: Optional[str] = None
-    api_secret: Optional[str] = None
-    testnet: bool = True
+    api_key: Optional[str] = Field(default=None, env="BYBIT__API_KEY")
+    api_secret: Optional[str] = Field(default=None, env="BYBIT__API_SECRET") 
+    testnet: bool = Field(default=True, env="BYBIT__TESTNET")
     
     # Rate limiting (conservative for production safety)
     requests_per_second: int = 5
