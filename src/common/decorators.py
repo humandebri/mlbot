@@ -391,3 +391,129 @@ def error_handler(
         return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
     
     return decorator
+
+
+def with_error_handling(exception_type: Type[Exception] = TradingBotError):
+    """
+    Error handling decorator that wraps exceptions.
+    
+    Args:
+        exception_type: Exception type to wrap other exceptions with
+    """
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except exception_type:
+                # Re-raise expected exception types
+                raise
+            except Exception as e:
+                # Wrap unexpected exceptions
+                logger.error(
+                    f"Unexpected error in {func.__name__}",
+                    exception=e,
+                    function=func.__name__
+                )
+                raise exception_type(f"Error in {func.__name__}: {str(e)}") from e
+        
+        @functools.wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except exception_type:
+                # Re-raise expected exception types
+                raise
+            except Exception as e:
+                # Wrap unexpected exceptions
+                logger.error(
+                    f"Unexpected error in {func.__name__}",
+                    exception=e,
+                    function=func.__name__
+                )
+                raise exception_type(f"Error in {func.__name__}: {str(e)}") from e
+        
+        return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+    
+    return decorator
+
+
+def retry_with_backoff(
+    max_attempts: int = 3,
+    initial_delay: float = 1.0,
+    backoff: float = 2.0,
+    max_delay: float = 60.0,
+    exceptions: tuple = (Exception,)
+):
+    """
+    Retry decorator with exponential backoff.
+    
+    Args:
+        max_attempts: Maximum number of retry attempts
+        initial_delay: Initial delay between retries in seconds
+        backoff: Multiplier for delay on each retry
+        max_delay: Maximum delay between retries
+        exceptions: Tuple of exceptions to catch and retry
+    """
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            last_exception = None
+            current_delay = initial_delay
+            
+            for attempt in range(max_attempts):
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+                    if attempt == max_attempts - 1:
+                        logger.error(
+                            f"Function {func.__name__} failed after {max_attempts} attempts",
+                            exception=e,
+                            attempts=max_attempts
+                        )
+                        raise
+                    
+                    logger.warning(
+                        f"Function {func.__name__} failed, retrying in {current_delay}s",
+                        exception=e,
+                        attempt=attempt + 1,
+                        max_attempts=max_attempts
+                    )
+                    await asyncio.sleep(current_delay)
+                    current_delay = min(current_delay * backoff, max_delay)
+            
+            raise last_exception
+        
+        @functools.wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            last_exception = None
+            current_delay = initial_delay
+            
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+                    if attempt == max_attempts - 1:
+                        logger.error(
+                            f"Function {func.__name__} failed after {max_attempts} attempts",
+                            exception=e,
+                            attempts=max_attempts
+                        )
+                        raise
+                    
+                    logger.warning(
+                        f"Function {func.__name__} failed, retrying in {current_delay}s",
+                        exception=e,
+                        attempt=attempt + 1,
+                        max_attempts=max_attempts
+                    )
+                    time.sleep(current_delay)
+                    current_delay = min(current_delay * backoff, max_delay)
+            
+            raise last_exception
+        
+        return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+    
+    return decorator

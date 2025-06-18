@@ -33,6 +33,8 @@ WORKDIR /app
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY models/ ./models/
+COPY main_dynamic_integration.py ./
+COPY .env.example ./
 
 # Create directories
 RUN mkdir -p data logs models
@@ -42,4 +44,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 # Run the trading system
-CMD ["python", "-u", "src/system/main.py"]
+CMD ["python", "-u", "main_dynamic_integration.py"]

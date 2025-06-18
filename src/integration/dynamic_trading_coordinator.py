@@ -346,13 +346,19 @@ class DynamicTradingCoordinator:
     async def _get_prediction(self, symbol: str, features: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Get prediction from integrated model service."""
         try:
-            # Import and use the inference engine directly in integrated mode
-            from ..ml_pipeline.pytorch_inference_engine import InferenceEngine
+            # Import and use the ONNX inference engine directly in integrated mode
+            from ..ml_pipeline.inference_engine import InferenceEngine
             
             # Initialize inference engine if not already done
             if not hasattr(self, '_inference_engine'):
                 from ..common.config import settings
                 self._inference_engine = InferenceEngine(settings)
+                # Load the model with correct path
+                model_path = "models/v3.1_improved/model.onnx"
+                if not self._inference_engine.load_model(model_path):
+                    logger.error(f"Failed to load model from {model_path}")
+                    return None
+                logger.info(f"Model loaded successfully from {model_path}")
             
             # Convert features to the format expected by the model
             feature_array = self._prepare_features_for_model(features)

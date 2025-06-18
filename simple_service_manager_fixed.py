@@ -33,21 +33,11 @@ class SimpleServiceManager:
         self.running = False
         
     async def start_ingestor(self) -> None:
-        """Start the data ingestor service as a background task."""
+        """Start the data ingestor service."""
         try:
             logger.info("Starting Ingestor...")
             self.ingestor = BybitIngestor()
-            
-            # Start ingestor in background task
-            ingestor_task = asyncio.create_task(
-                self.ingestor.start(), 
-                name="Ingestor-Main"
-            )
-            self.tasks.append(ingestor_task)
-            
-            # Give it a moment to initialize
-            await asyncio.sleep(2)
-            
+            await self.ingestor.start()
             logger.info("Ingestor started successfully")
         except Exception as e:
             logger.error(f"Failed to start Ingestor: {e}")
@@ -64,7 +54,7 @@ class SimpleServiceManager:
             self.feature_hub.redis_streams = RedisStreams(self.feature_hub.redis_client)
             
             # CRITICAL: Initialize all feature engines
-            self.feature_hub._initialize_feature_engines()
+            await self.feature_hub._initialize_feature_engines()
             logger.info("Feature engines initialized")
             
             # CRITICAL: Setup consumer groups
@@ -95,10 +85,11 @@ class SimpleServiceManager:
             logger.info("Starting OrderRouter...")
             self.order_router = OrderRouter()
             
+            # Initialize components
+            await self.order_router.initialize()
+            
             # Set running flag
             self.order_router.running = True
-            
-            # OrderRouter initializes itself in __init__, no need to call initialize()
             
             logger.info("OrderRouter started successfully")
             
@@ -183,7 +174,7 @@ class SimpleServiceManager:
             },
             "order_router": {
                 "running": self.order_router.running if self.order_router else False,
-                "initialized": True if self.order_router else False  # OrderRouter is initialized in __init__
+                "initialized": self.order_router.initialized if self.order_router else False
             },
             "account_monitor": {
                 "running": self.account_monitor._running if self.account_monitor else False,

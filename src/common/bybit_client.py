@@ -15,7 +15,8 @@ from websockets.exceptions import ConnectionClosed, InvalidURI
 
 from .config import settings
 from .config_manager import ConfigManager
-from .decorators import profile_performance, with_error_handling, retry_with_backoff
+from .decorators import with_error_handling, retry_with_backoff
+from .performance import profile_performance
 from .error_handler import error_context, error_handler
 from .exceptions import APIError, ConnectionError, TradingBotError
 from .logging import get_logger
@@ -51,7 +52,9 @@ class BybitWebSocketClient:
         on_message: Callable[[Symbol, Dict[str, Any]], None],
         testnet: Optional[bool] = None,
     ):
-        self.config = ConfigManager().get_config()
+        # Use settings directly instead of ConfigManager
+        from .config import settings
+        self.config = settings
         self.symbols = [normalize_symbol(s) for s in symbols]
         self.on_message = on_message
         self.testnet = testnet if testnet is not None else self.config.bybit.testnet
@@ -143,7 +146,7 @@ class BybitWebSocketClient:
             try:
                 # Connect with optimized settings
                 ping_interval = self.config.bybit.ping_interval
-                connection_timeout = safe_int(self.config.bybit.connection_timeout, 60)
+                connection_timeout = 60  # Use default 60 second timeout
                 
                 self.websocket = await asyncio.wait_for(
                     websockets.connect(
@@ -157,40 +160,40 @@ class BybitWebSocketClient:
                     ),
                     timeout=connection_timeout
                 )
+                
+                logger.info("WebSocket connected successfully")
+                self.reconnect_count = 0
+                
+                # Update connection metrics
+                for symbol in self.symbols:
+                    set_gauge(WEBSOCKET_CONNECTIONS, 1, symbol=symbol)
+                
+                # Subscribe to feeds
+                await self._subscribe_to_feeds()
+                
+                # Start message processing tasks
+                tasks = [
+                    asyncio.create_task(self._message_receiver()),
+                    asyncio.create_task(self._ping_sender()),
+                    asyncio.create_task(self._buffer_flusher()),
+                ]
+                
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
             
-            logger.info("WebSocket connected successfully")
-            self.reconnect_count = 0
-            
-            # Update connection metrics
-            for symbol in self.symbols:
-                set_gauge(WEBSOCKET_CONNECTIONS, 1, symbol=symbol)
-            
-            # Subscribe to feeds
-            await self._subscribe_to_feeds()
-            
-            # Start message processing tasks
-            tasks = [
-                asyncio.create_task(self._message_receiver()),
-                asyncio.create_task(self._ping_sender()),
-                asyncio.create_task(self._buffer_flusher()),
-            ]
-            
-            try:
-                await asyncio.gather(*tasks)
-            finally:
-                for task in tasks:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-        
-        except (ConnectionClosed, InvalidURI) as e:
-            logger.warning(f"WebSocket connection error: {e}")
-            raise
-        except Exception as e:
-            logger.error("Unexpected error in WebSocket connection", exception=e)
-            raise
+            except (ConnectionClosed, InvalidURI) as e:
+                logger.warning(f"WebSocket connection error: {e}")
+                raise
+            except Exception as e:
+                logger.error("Unexpected error in WebSocket connection", exception=e)
+                raise
     
     async def _subscribe_to_feeds(self) -> None:
         """Subscribe to all required data feeds efficiently."""
@@ -559,8 +562,13 @@ class BybitRESTClient:
         self.request_times.append(now)
     
     async def get_open_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get open positions."""
+        """Get open positions with proper error handling."""
         try:
+            # CRITICAL: Ensure session exists
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+                logger.info("Created new aiohttp session for positions")
+            
             async with self.request_semaphore:
                 await self._wait_for_rate_limit()
                 
@@ -572,18 +580,47 @@ class BybitRESTClient:
                 if symbol:
                     params["symbol"] = symbol
                 
-                async with self.session.get(url, params=params, headers=self._get_auth_headers("GET", "/v5/position/list", params)) as response:
+                # Get auth headers
+                headers = self._get_auth_headers("GET", "/v5/position/list", params)
+                
+                # CRITICAL: Add None check for headers
+                if not headers:
+                    logger.error("Failed to generate auth headers for positions")
+                    return []
+                
+                async with self.session.get(url, params=params, headers=headers) as response:
                     if response.status == 200:
                         data = await response.json()
+                        
+                        # CRITICAL: Check if data is None
+                        if data is None:
+                            logger.error("Received None response from positions API")
+                            return []
+                        
                         if data.get("retCode") == 0:
-                            return data.get("result", {}).get("list", [])
+                            result = data.get("result", {})
+                            # CRITICAL: Safe navigation for nested dict
+                            if isinstance(result, dict):
+                                return result.get("list", [])
+                            else:
+                                logger.error(f"Unexpected result format: {type(result)}")
+                                return []
                         else:
                             logger.error(f"API error getting positions: {data.get('retMsg')}")
                     else:
                         logger.error(f"HTTP error {response.status} getting positions")
+                        # Log response body for debugging
+                        try:
+                            error_body = await response.text()
+                            logger.error(f"Error response: {error_body[:200]}")
+                        except:
+                            pass
                         
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error fetching positions: {e}")
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type="network_error")
         except Exception as e:
-            logger.error("Error fetching positions", exception=e)
+            logger.error(f"Unexpected error fetching positions: {e}", exc_info=True)
             increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
         
         return []
@@ -838,6 +875,39 @@ class BybitRESTClient:
             increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
         
         return False
+    
+    async def get_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get ticker information for a symbol."""
+        try:
+            async with self.request_semaphore:
+                await self._wait_for_rate_limit()
+                
+                url = urljoin(self.base_url, "/v5/market/tickers")
+                params = {
+                    "category": "linear",
+                    "symbol": symbol
+                }
+                
+                if not self.session:
+                    self.session = aiohttp.ClientSession()
+                
+                async with self.session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("retCode") == 0:
+                            result = data.get("result", {})
+                            if result.get("list"):
+                                return result["list"][0]
+                        else:
+                            logger.error(f"API error getting ticker: {data.get('retMsg')}")
+                    else:
+                        logger.error(f"HTTP error {response.status} getting ticker")
+                        
+        except Exception as e:
+            logger.error("Error getting ticker", exception=e)
+            increment_counter(ERRORS_TOTAL, component="rest_api", error_type=type(e).__name__)
+        
+        return None
     
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Set leverage for a symbol."""

@@ -68,6 +68,11 @@ class WebSocketError(ExchangeError):
     pass
 
 
+class ConnectionError(ExchangeError):
+    """Raised when connection to exchange fails."""
+    pass
+
+
 class DataError(TradingBotError):
     """Base exception for data-related errors."""
     pass

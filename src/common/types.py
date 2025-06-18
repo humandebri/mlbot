@@ -4,7 +4,7 @@ Common type definitions for the trading bot.
 
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, List, Literal, NewType, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, NewType, Optional, Tuple, Union
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -315,7 +315,7 @@ ConfigurationMap = Dict[str, ConfigDict]
 MetricsMap = Dict[str, Union[int, float, str]]
 
 # Callback types
-DataCallback = callable[[MarketDataPoint], None]
-SignalCallback = callable[[TradingSignal], None]
-ErrorCallback = callable[[Exception], None]
-StatusCallback = callable[[SystemStatus], None]
+DataCallback = Callable[[MarketDataPoint], None]
+SignalCallback = Callable[[TradingSignal], None]
+ErrorCallback = Callable[[Exception], None]
+StatusCallback = Callable[[SystemStatus], None]

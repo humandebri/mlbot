@@ -54,6 +54,7 @@ class FeatureHub:
         self.redis_streams: Optional[RedisStreams] = None
         
         # Feature processors (imported below to avoid circular imports)
+        self.price_engine = None
         self.micro_liquidity_engine = None
         self.volatility_engine = None
         self.liquidation_engine = None
@@ -93,7 +94,7 @@ class FeatureHub:
             self.redis_streams = RedisStreams(self.redis_client)
             
             # Initialize feature processors
-            await self._initialize_feature_engines()
+            self._initialize_feature_engines()
             
             # Setup consumer groups for data streams
             await self._setup_consumer_groups()
@@ -130,8 +131,9 @@ class FeatureHub:
         
         logger.info("FeatureHub stopped successfully")
     
-    async def _initialize_feature_engines(self):
+    def _initialize_feature_engines(self):
         """Initialize all feature processing engines."""
+        from .price_features import PriceFeatureEngine
         from .micro_liquidity import MicroLiquidityEngine
         from .volatility_momentum import VolatilityMomentumEngine
         from .liquidation_features import LiquidationFeatureEngine
@@ -139,6 +141,7 @@ class FeatureHub:
         from .advanced_features import AdvancedFeatureAggregator
         
         # Initialize engines with optimized parameters
+        self.price_engine = PriceFeatureEngine()
         self.micro_liquidity_engine = MicroLiquidityEngine()
         self.volatility_engine = VolatilityMomentumEngine()
         self.liquidation_engine = LiquidationFeatureEngine()
@@ -267,15 +270,37 @@ class FeatureHub:
     
     async def _update_kline_features(self, symbol: str, data: Dict[str, Any]):
         """Update features based on kline data."""
+        # First, generate basic price features
+        if self.price_engine:
+            price_features = self.price_engine.process_kline(symbol, data)
+            self._merge_features(symbol, price_features)
+        
+        # Then, generate volatility features
         if self.volatility_engine:
-            features = self.volatility_engine.process_kline(symbol, data)
-            self._merge_features(symbol, features)
+            volatility_features = self.volatility_engine.process_kline(symbol, data)
+            self._merge_features(symbol, volatility_features)
     
     async def _update_orderbook_features(self, symbol: str, data: Dict[str, Any]):
         """Update features based on orderbook data."""
         if self.micro_liquidity_engine:
             features = self.micro_liquidity_engine.process_orderbook(symbol, data)
             self._merge_features(symbol, features)
+        
+        # Update price engine with orderbook features
+        if self.price_engine:
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            if bids and asks:
+                # Get best bid/ask
+                best_bid = float(bids[0][0]) if bids else 0
+                best_ask = float(asks[0][0]) if asks else 0
+                bid_size = float(bids[0][1]) if bids else 0
+                ask_size = float(asks[0][1]) if asks else 0
+                
+                ob_features = self.price_engine.update_orderbook_features(
+                    symbol, best_bid, best_ask, bid_size, ask_size
+                )
+                self._merge_features(symbol, ob_features)
         
         # Update advanced features with orderbook data
         if self.advanced_features_engine:
@@ -288,6 +313,28 @@ class FeatureHub:
         if self.volatility_engine:
             features = self.volatility_engine.process_trade(symbol, data)
             self._merge_features(symbol, features)
+        
+        # Track buy/sell volumes for order flow imbalance
+        if self.price_engine:
+            # Get or initialize trade volume tracking
+            if not hasattr(self, 'trade_volumes'):
+                self.trade_volumes = defaultdict(lambda: {"buy": 0, "sell": 0})
+            
+            side = data.get("side", "").lower()
+            size = float(data.get("size", 0))
+            
+            if side in ["buy", "bid"]:
+                self.trade_volumes[symbol]["buy"] += size
+            elif side in ["sell", "ask"]:
+                self.trade_volumes[symbol]["sell"] += size
+            
+            # Calculate order flow imbalance
+            trade_features = self.price_engine.update_trade_features(
+                symbol,
+                self.trade_volumes[symbol]["buy"],
+                self.trade_volumes[symbol]["sell"]
+            )
+            self._merge_features(symbol, trade_features)
         
         # Update advanced features with trade data
         if self.advanced_features_engine:
@@ -306,6 +353,9 @@ class FeatureHub:
         if self.liquidation_engine:
             features = self.liquidation_engine.process_liquidation(symbol, data)
             self._merge_features(symbol, features)
+        
+        # Liquidation features are handled by liquidation_engine above
+        # No additional liquidation processing needed in price_engine
     
     async def _update_oi_features(self, symbol: str, data: Dict[str, Any]):
         """Update features based on open interest data."""
@@ -314,6 +364,9 @@ class FeatureHub:
             "open_interest": data.get("open_interest", 0),
             "oi_timestamp": data.get("timestamp", 0)
         })
+        
+        # OI features are handled directly in the merge above
+        # No additional OI processing needed in price_engine
         
         # Update advanced features with OI data
         if self.advanced_features_engine:
@@ -327,6 +380,9 @@ class FeatureHub:
             "funding_rate": data.get("funding_rate", 0),
             "funding_timestamp": data.get("timestamp", 0)
         })
+        
+        # Funding rate features are handled directly in the merge above
+        # No additional funding processing needed in price_engine
     
     def _merge_features(self, symbol: str, new_features: Dict[str, float]):
         """Merge new features into the cache efficiently."""

@@ -33,7 +33,12 @@ class PerformanceMonitor:
         
         # Start background monitoring
         self._monitoring = True
-        asyncio.create_task(self._monitor_system_resources())
+        # Only start monitoring if we're in an async context
+        try:
+            asyncio.create_task(self._monitor_system_resources())
+        except RuntimeError:
+            # No event loop running, skip background monitoring
+            pass
     
     async def _monitor_system_resources(self) -> None:
         """Monitor system resources in background."""

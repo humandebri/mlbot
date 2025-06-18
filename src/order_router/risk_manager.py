@@ -23,7 +23,8 @@ warnings.filterwarnings('ignore')
 
 from ..common.config import settings
 from ..common.config_manager import ConfigManager
-from ..common.decorators import profile_performance, with_error_handling
+from ..common.decorators import with_error_handling
+from ..common.performance import profile_performance
 from ..common.error_handler import error_context
 from ..common.exceptions import RiskManagementError
 from ..common.logging import get_logger
@@ -343,72 +344,51 @@ class RiskManager:
                 }
                 
                 with error_context(context):
-                    # Check if trading is halted
-                    if getattr(self, 'trading_halted', False):
-                        halt_reason = getattr(self, 'halt_reason', 'Unknown')
-                        increment_counter(RISK_VIOLATIONS, violation_type="trading_halted")
-                        return False, f"Trading halted: {halt_reason}", {}
-                    
-                    # Quick pre-checks
-                    if not self.can_trade(symbol, side):
-                        increment_counter(RISK_VIOLATIONS, violation_type="basic_checks")
-                        return False, "Basic risk checks failed", {}
-                    
-                    # Calculate position value safely
-                    position_value = safe_quantity * safe_price
-                    
-                    # Comprehensive risk checks
-                    checks = [
-                        ("rate_limits", self._check_rate_limits()),
-                        ("cooldown", self._check_cooldown(symbol)),
-                        ("position_size", self._check_position_size(symbol, position_value)),
-                        ("total_exposure", self._check_total_exposure(position_value)),
-                        ("leverage", self._check_leverage(position_value))
-                    ]
-                    
-                    # Async checks
-                    correlation_check = await self._check_correlation_limits(symbol)
-                    checks.append(("correlation", correlation_check))
-                    
-                    # Process all checks
-                    for check_name, (passed, reason) in checks:
-                        if not passed:
-                            increment_counter(RISK_VIOLATIONS, violation_type=check_name)
-                            logger.warning(f"Risk check failed: {check_name}", 
-                                         reason=reason, symbol=symbol)
-                            return False, reason, {}
-                    
-                    # Calculate risk metrics
-                    risk_metrics = self._calculate_risk_metrics(symbol, position_value)
-                    
-                    logger.debug(f"Order risk check passed for {symbol}", **risk_metrics)
-                    return True, None, risk_metrics
-                if not leverage_check[0]:
-                    return False, leverage_check[1], {}
-                
-                # Check daily loss limit
-                loss_check = self._check_daily_loss_limit()
-                if not loss_check[0]:
-                    return False, loss_check[1], {}
-                
-                # Calculate risk metrics
-                risk_metrics = self._calculate_order_risk_metrics(
-                    symbol, side, quantity, price
-                )
-                
-                # All checks passed
-                logger.info("Order risk check passed",
-                           symbol=symbol,
-                           side=side,
-                           quantity=quantity,
-                           price=price,
-                           risk_metrics=risk_metrics)
-                
-                return True, None, risk_metrics
-                
-            except Exception as e:
-                logger.error("Error in order risk check", exception=e)
-                return False, f"Risk check error: {str(e)}", {}
+                    try:
+                        # Check if trading is halted
+                        if getattr(self, 'trading_halted', False):
+                            halt_reason = getattr(self, 'halt_reason', 'Unknown')
+                            increment_counter(RISK_VIOLATIONS, violation_type="trading_halted")
+                            return False, f"Trading halted: {halt_reason}", {}
+                        
+                        # Quick pre-checks
+                        if not self.can_trade(symbol, side):
+                            increment_counter(RISK_VIOLATIONS, violation_type="basic_checks")
+                            return False, "Basic risk checks failed", {}
+                        
+                        # Calculate position value safely
+                        position_value = safe_quantity * safe_price
+                        
+                        # Comprehensive risk checks
+                        checks = [
+                            ("rate_limits", self._check_rate_limits()),
+                            ("cooldown", self._check_cooldown(symbol)),
+                            ("position_size", self._check_position_size(symbol, position_value)),
+                            ("total_exposure", self._check_total_exposure(position_value)),
+                            ("leverage", self._check_leverage(position_value))
+                        ]
+                        
+                        # Async checks
+                        correlation_check = await self._check_correlation_limits(symbol)
+                        checks.append(("correlation", correlation_check))
+                        
+                        # Process all checks
+                        for check_name, (passed, reason) in checks:
+                            if not passed:
+                                increment_counter(RISK_VIOLATIONS, violation_type=check_name)
+                                logger.warning(f"Risk check failed: {check_name}", 
+                                             reason=reason, symbol=symbol)
+                                return False, reason, {}
+                        
+                        # Calculate risk metrics
+                        risk_metrics = self._calculate_risk_metrics(symbol, position_value)
+                        
+                        logger.debug(f"Order risk check passed for {symbol}", **risk_metrics)
+                        return True, None, risk_metrics
+                        
+                    except Exception as e:
+                        logger.error("Error in order risk check", exception=e)
+                        return False, f"Risk check error: {str(e)}", {}
     
     async def add_position(
         self,

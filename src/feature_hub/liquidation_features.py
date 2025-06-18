@@ -17,9 +17,10 @@ import numpy as np
 
 from ..common.config import settings
 from ..common.logging import get_logger
-from ..common.decorators import profile_performance, with_error_handling
+from ..common.decorators import with_error_handling
+from ..common.performance import profile_performance
 from ..common.error_handler import error_context
-from ..common.exceptions import FeatureEngineError, TradingBotError
+from ..common.exceptions import FeatureError, TradingBotError
 from ..common.performance import performance_context, MemoryOptimizer
 from ..common.types import Symbol, FeatureDict
 from ..common.utils import safe_float, safe_int, get_utc_timestamp, clamp
@@ -83,7 +84,7 @@ class LiquidationFeatureEngine:
         self.cluster_analysis: Dict[str, Dict[str, Any]] = defaultdict(dict)
     
     @profile_performance(include_memory=True)
-    @with_error_handling(FeatureEngineError)
+    @with_error_handling(FeatureError)
     def process_liquidation(self, symbol: Symbol, data: Dict[str, Any]) -> FeatureDict:
         """
         Process liquidation event and compute advanced features.
