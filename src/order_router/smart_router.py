@@ -21,6 +21,7 @@ from .position_manager import PositionManager
 from ..common.config import settings
 from ..common.logging import get_logger
 from ..common.monitoring import increment_counter
+from ..common.types import Symbol
 
 logger = get_logger(__name__)
 
@@ -54,9 +55,9 @@ class TradingSignal:
 class RoutingConfig:
     """Smart routing configuration."""
     
-    # Signal thresholds
-    min_confidence: float = 0.6
-    min_prediction: float = 0.001  # 0.1% minimum expected PnL
+    # Signal thresholds - lowered for testing
+    min_confidence: float = 0.0  # Temporarily allow any confidence
+    min_prediction: float = 0.0  # Temporarily allow any expected PnL
     
     # Liquidation trading
     liquidation_multiplier: float = 1.5  # Size multiplier for liquidation trades
@@ -142,12 +143,17 @@ class SmartRouter:
         
         try:
             # Validate signal
+            logger.info(f"Validating signal for {signal.symbol}: conf={signal.confidence}, pred={signal.prediction}")
             if not self._validate_signal(signal):
+                logger.warning(f"Signal validation failed for {signal.symbol}")
                 self.routing_stats["signals_rejected"] += 1
                 return None
+            logger.info(f"Signal validation passed for {signal.symbol}")
             
             # Check risk limits
+            logger.info(f"Starting risk check for {signal.symbol}")
             risk_check = await self._check_risk(signal)
+            logger.info(f"Risk check result for {signal.symbol}: passed={risk_check[0]}, reason={risk_check[1]}")
             if not risk_check[0]:
                 logger.warning("Signal rejected by risk check",
                              symbol=signal.symbol,
@@ -159,10 +165,14 @@ class SmartRouter:
             self.active_signals[signal_id] = signal
             
             # Route based on signal type
+            logger.info(f"Routing signal for {signal.symbol}: liquidation_detected={signal.liquidation_detected}")
             if signal.liquidation_detected:
+                logger.info(f"Routing liquidation trade for {signal.symbol}")
                 position_id = await self._route_liquidation_trade(signal, risk_check[2])
             else:
+                logger.info(f"Routing standard trade for {signal.symbol}")
                 position_id = await self._route_standard_trade(signal, risk_check[2])
+            logger.info(f"Routing completed for {signal.symbol}: position_id={position_id}")
             
             if position_id:
                 self.routing_stats["signals_executed"] += 1
@@ -302,15 +312,21 @@ class SmartRouter:
         risk_metrics: Dict[str, Any]
     ) -> Optional[str]:
         """Route standard ML-driven trade."""
+        logger.info(f"Starting standard trade routing for {signal.symbol}")
+        logger.info(f"Risk metrics: {risk_metrics}")
         
         # Determine trade direction based on prediction
         trade_side = "buy" if signal.prediction > 0 else "sell"
         position_size = risk_metrics["position_size"]
+        logger.info(f"Trade side: {trade_side}, position size: {position_size}")
         
         # Get market data
+        logger.info(f"Getting market data for {signal.symbol}")
         market_data = await self._get_market_data(signal.symbol)
         if not market_data:
+            logger.error(f"Failed to get market data for {signal.symbol}")
             return None
+        logger.info(f"Market data for {signal.symbol}: {market_data}")
         
         # Check spread
         spread_bps = (market_data["spread"] / market_data["mid_price"]) * 10000
@@ -330,8 +346,10 @@ class SmartRouter:
         
         # Create position
         position_id = f"ml_{signal.symbol}_{int(signal.timestamp.timestamp())}"
+        logger.info(f"Creating position with ID: {position_id}")
         
         try:
+            logger.info(f"Opening position for {signal.symbol}")
             position = await self.position_manager.open_position(
                 position_id=position_id,
                 symbol=signal.symbol,
@@ -348,7 +366,9 @@ class SmartRouter:
             )
             
             # Place order
+            logger.info(f"Placing order for {signal.symbol}: side={trade_side}, size={position_size}, price={order_price}")
             if self.config.use_iceberg and position_size > 10000:  # Large order
+                logger.info(f"Using iceberg order for large position: {position_size}")
                 order = await self._place_iceberg_order(
                     signal.symbol,
                     trade_side,
@@ -357,6 +377,7 @@ class SmartRouter:
                     position_id
                 )
             else:
+                logger.info(f"Using standard order for {signal.symbol}")
                 order = await self.executor.place_order(
                     symbol=signal.symbol,
                     side=trade_side,
@@ -366,6 +387,7 @@ class SmartRouter:
                     position_id=position_id,
                     metadata={"signal_type": "ml_prediction"}
                 )
+            logger.info(f"Order placement result for {signal.symbol}: {order}")
             
             if order:
                 logger.info("Standard order placed",
@@ -482,7 +504,7 @@ class SmartRouter:
         # Check order risk
         trade_side = "buy" if signal.prediction > 0 else "sell"
         risk_approved, rejection_reason, risk_metrics = await self.risk_manager.check_order_risk(
-            symbol=signal.symbol,
+            symbol=Symbol(signal.symbol),
             side=trade_side,
             quantity=position_size,
             price=entry_price

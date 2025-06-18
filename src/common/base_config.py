@@ -182,7 +182,7 @@ class ExchangeConfig(BaseSettings):
         return v.strip()
 
 
-class MLConfig(BaseModel):
+class MLConfig(BaseSettings):
     """Machine learning configuration settings."""
     
     model_config = SettingsConfigDict(
@@ -191,17 +191,27 @@ class MLConfig(BaseModel):
     )
     
     # Model settings
-    model_path: str = Field(default="models/v3.1_improved/model.onnx", alias="model__model_path")
-    scaler_path: str = Field(default="models/v3.1_improved/scaler.pkl", alias="model__scaler_path")
-    feature_count: int = Field(default=44, ge=1, le=500, alias="model__feature_count")
+    model_path: str = Field(default="models/v3.1_improved/model.onnx", alias="MODEL__MODEL_PATH")
+    scaler_path: str = Field(default="models/v3.1_improved/scaler.pkl", alias="MODEL__SCALER_PATH")
+    feature_count: int = Field(default=44, ge=1, le=500, alias="MODEL__FEATURE_COUNT")
     
     # Inference settings
-    batch_size: int = Field(default=32, ge=1, le=1000, alias="model__batch_size")
-    max_inference_time_ms: float = Field(default=100.0, ge=1.0, le=1000.0, alias="model__max_inference_time_ms")
+    batch_size: int = Field(default=32, ge=1, le=1000, alias="MODEL__BATCH_SIZE")
+    max_inference_time_ms: float = Field(default=100.0, ge=1.0, le=1000.0, alias="MODEL__MAX_INFERENCE_TIME_MS")
     
     # Feature engineering
-    lookback_windows: List[int] = Field(default=[1, 5, 15, 30, 60], alias="model__lookahead_windows")
-    delta_values: List[float] = Field(default=[0.001, 0.002, 0.005], alias="model__delta_values")
+    lookback_windows: List[int] = Field(default=[1, 5, 15, 30, 60], alias="MODEL__LOOKAHEAD_WINDOWS")
+    delta_values: List[float] = Field(default=[0.001, 0.002, 0.005], alias="MODEL__DELTA_VALUES")
+    
+    # Advanced ML settings
+    enable_thompson_sampling: bool = Field(default=False, alias="MODEL__ENABLE_THOMPSON_SAMPLING")
+    confidence_threshold: float = Field(default=0.7, alias="MODEL__CONFIDENCE_THRESHOLD")
+    uncertainty_scaling: float = Field(default=1.0, alias="MODEL__UNCERTAINTY_SCALING")
+    
+    # ONNX Runtime settings
+    session_options: Optional[Dict[str, Any]] = Field(default=None, alias="MODEL__SESSION_OPTIONS")
+    providers: List[str] = Field(default=["CPUExecutionProvider"], alias="MODEL__PROVIDERS")
+    optimization_level: str = Field(default="all", alias="MODEL__OPTIMIZATION_LEVEL")
     
     @field_validator('lookback_windows', 'delta_values', mode='before')
     @classmethod

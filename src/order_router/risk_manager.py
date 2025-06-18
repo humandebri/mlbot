@@ -161,7 +161,7 @@ class Position:
         """PnL percentage."""
         entry_value = abs(self.quantity * self.entry_price)
         if entry_value > 0:
-            return float((self.pnl / entry_value) * 100)
+            return float((float(self.pnl) / float(entry_value)) * 100)
         return 0.0
     
     def update_price(self, new_price: Decimal) -> None:
@@ -290,7 +290,7 @@ class RiskManager:
                     
                 # Check if we're in cooldown period
                 last_trade_time = getattr(self, '_last_trade_time', 0)
-                current_time = get_utc_timestamp() / 1000.0
+                current_time = datetime.now().timestamp()
                 cooldown_remaining = self.config.cooldown_period_seconds - (current_time - last_trade_time)
                 if cooldown_remaining > 0:
                     logger.debug(f"Cooldown period active: {cooldown_remaining:.1f}s remaining")
@@ -299,11 +299,11 @@ class RiskManager:
                 return True
                 
             except Exception as e:
-                error_handler.handle_error(RiskManagementError(f"Error checking trade permission: {e}"), {
-                    "symbol": symbol,
-                    "side": side,
-                    "size": size
-                })
+                logger.error("Error checking trade permission", 
+                           exception=e, 
+                           symbol=symbol, 
+                           side=side, 
+                           size=float(size) if size else None)
                 return False  # Default to safe mode
     
     @profile_performance()
@@ -352,12 +352,12 @@ class RiskManager:
                             return False, f"Trading halted: {halt_reason}", {}
                         
                         # Quick pre-checks
-                        if not self.can_trade(symbol, side):
+                        if not self.can_trade(symbol, side, safe_quantity):
                             increment_counter(RISK_VIOLATIONS, violation_type="basic_checks")
                             return False, "Basic risk checks failed", {}
                         
                         # Calculate position value safely
-                        position_value = safe_quantity * safe_price
+                        position_value = float(safe_quantity * safe_price)
                         
                         # Comprehensive risk checks
                         checks = [
@@ -381,7 +381,7 @@ class RiskManager:
                                 return False, reason, {}
                         
                         # Calculate risk metrics
-                        risk_metrics = self._calculate_risk_metrics(symbol, position_value)
+                        risk_metrics = self._calculate_order_risk_metrics(symbol, side, float(safe_quantity), float(safe_price))
                         
                         logger.debug(f"Order risk check passed for {symbol}", **risk_metrics)
                         return True, None, risk_metrics
@@ -563,7 +563,7 @@ class RiskManager:
         risk_per_unit = abs(entry_price - stop_loss_price)
         
         # Base position size
-        base_size = account_risk / risk_per_unit if risk_per_unit > 0 else 0
+        base_size = float(account_risk) / float(risk_per_unit) if risk_per_unit > 0 else 0
         
         # Apply Kelly criterion
         if confidence > 0.5:
@@ -585,13 +585,13 @@ class RiskManager:
             kelly_size *= vol_scalar
         
         # Apply position limits
-        max_size = self.config.max_position_size_usd / entry_price
+        max_size = self.config.max_position_size_usd / float(entry_price)
         final_size = min(kelly_size, max_size)
         
         # Check total exposure
         current_exposure = self._calculate_total_exposure()
         remaining_capacity = self.config.max_total_exposure_usd - current_exposure
-        max_allowed = remaining_capacity / entry_price
+        max_allowed = remaining_capacity / float(entry_price)
         
         final_size = min(final_size, max_allowed)
         
@@ -617,7 +617,7 @@ class RiskManager:
         metrics = {
             "current_equity": self.current_equity,
             "total_exposure": total_exposure,
-            "exposure_pct": total_exposure / self.current_equity if self.current_equity > 0 else 0,
+            "exposure_pct": total_exposure / float(self.current_equity) if self.current_equity > 0 else 0,
             "position_count": position_count,
             "max_positions": self.config.max_positions,
             "total_unrealized_pnl": total_unrealized_pnl,
@@ -676,27 +676,30 @@ class RiskManager:
         return True, None
     
     def _check_position_size(self, symbol: str, position_value: float) -> Tuple[bool, Optional[str]]:
-        """Check position size limits."""
-        if position_value > self.config.max_position_size_usd:
+        """Check position size limits with small tolerance for float precision."""
+        # Add 0.01 tolerance for float precision issues
+        tolerance = 0.01
+        if position_value > self.config.max_position_size_usd + tolerance:
             return False, f"Position size ${position_value:.2f} exceeds limit ${self.config.max_position_size_usd:.2f}"
         
         # Check existing position
         existing_exposure = sum(
-            p.position_value for p in self.positions.values() 
+            float(p.position_value) for p in self.positions.values() 
             if p.symbol == symbol
         )
         
-        if existing_exposure + position_value > self.config.max_position_size_usd:
+        if existing_exposure + position_value > self.config.max_position_size_usd + tolerance:
             return False, f"Total position in {symbol} would exceed limit"
         
         return True, None
     
     def _check_total_exposure(self, additional_value: float) -> Tuple[bool, Optional[str]]:
-        """Check total exposure limits."""
+        """Check total exposure limits with small tolerance for float precision."""
         current_exposure = self._calculate_total_exposure()
         new_exposure = current_exposure + additional_value
+        tolerance = 0.01
         
-        if new_exposure > self.config.max_total_exposure_usd:
+        if new_exposure > self.config.max_total_exposure_usd + tolerance:
             return False, f"Total exposure ${new_exposure:.2f} would exceed limit ${self.config.max_total_exposure_usd:.2f}"
         
         return True, None
@@ -705,7 +708,7 @@ class RiskManager:
         """Check leverage limits."""
         current_exposure = self._calculate_total_exposure()
         new_exposure = current_exposure + position_value
-        leverage = new_exposure / self.current_equity if self.current_equity > 0 else 0
+        leverage = new_exposure / float(self.current_equity) if self.current_equity > 0 else 0
         
         if leverage > self.config.max_leverage:
             return False, f"Leverage {leverage:.1f}x would exceed limit {self.config.max_leverage}x"
@@ -713,15 +716,16 @@ class RiskManager:
         return True, None
     
     def _check_daily_loss_limit(self) -> Tuple[bool, Optional[str]]:
-        """Check daily loss limits."""
+        """Check daily loss limits with small tolerance for float precision."""
         today = datetime.now().strftime("%Y-%m-%d")
         daily_loss = -self.daily_pnl[today]  # Convert to positive for comparison
+        tolerance = 0.01
         
-        if daily_loss >= self.config.max_daily_loss_usd:
+        if daily_loss >= self.config.max_daily_loss_usd + tolerance:
             return False, f"Daily loss ${daily_loss:.2f} exceeds limit ${self.config.max_daily_loss_usd:.2f}"
         
         # Check circuit breaker
-        daily_loss_pct = daily_loss / self.current_equity if self.current_equity > 0 else 0
+        daily_loss_pct = daily_loss / float(self.current_equity) if self.current_equity > 0 else 0
         if daily_loss_pct >= self.config.circuit_breaker_loss_pct:
             self._trigger_circuit_breaker(f"Daily loss {daily_loss_pct:.1%} exceeded circuit breaker threshold")
             return False, "Circuit breaker triggered"
@@ -778,7 +782,7 @@ class RiskManager:
     
     def _calculate_total_exposure(self) -> float:
         """Calculate total portfolio exposure."""
-        return sum(p.position_value for p in self.positions.values())
+        return float(sum(float(p.position_value) for p in self.positions.values()))
     
     def _update_exposure_metrics(self) -> None:
         """Update exposure and risk metrics."""
@@ -801,7 +805,7 @@ class RiskManager:
         if self.current_equity > self.peak_equity:
             self.peak_equity = self.current_equity
         
-        self.current_drawdown = (self.peak_equity - self.current_equity) / self.peak_equity
+        self.current_drawdown = (float(self.peak_equity) - float(self.current_equity)) / float(self.peak_equity)
         self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
         
         # Check max drawdown limit
@@ -841,12 +845,12 @@ class RiskManager:
         # Calculate position risk
         stop_loss_price = self._calculate_stop_loss(side, price)
         position_risk = abs(price - stop_loss_price) * quantity
-        risk_pct = position_risk / self.current_equity if self.current_equity > 0 else 0
+        risk_pct = position_risk / float(self.current_equity) if self.current_equity > 0 else 0
         
         # Calculate new exposure
         current_exposure = self._calculate_total_exposure()
         new_exposure = current_exposure + position_value
-        new_leverage = new_exposure / self.current_equity if self.current_equity > 0 else 0
+        new_leverage = new_exposure / float(self.current_equity) if self.current_equity > 0 else 0
         
         return {
             "position_value": position_value,
