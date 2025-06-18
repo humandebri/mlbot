@@ -718,11 +718,19 @@ class BybitRESTClient:
                 await self._wait_for_rate_limit()
                 
                 url = urljoin(self.base_url, "/v5/order/create")
+                # Map order types to Bybit API format
+                order_type_map = {
+                    "limit": "Limit",
+                    "market": "Market",
+                    "limit_maker": "LimitMaker",
+                    "post_only": "PostOnly"
+                }
+                
                 params = {
                     "category": "linear",
                     "symbol": symbol,
                     "side": side.capitalize(),  # Buy/Sell
-                    "orderType": order_type.capitalize(),  # Limit/Market
+                    "orderType": order_type_map.get(order_type.lower(), order_type.capitalize()),
                     "qty": str(qty),
                     "reduceOnly": reduce_only
                 }
@@ -997,19 +1005,24 @@ class BybitRESTClient:
             return {}
         
         timestamp = str(int(time.time() * 1000))
+        recv_window = "5000"
         
-        # Create param string
+        # Create param string based on method
         if method == "GET":
+            # For GET requests, create query string
             param_str = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+            # The signature payload for GET requests includes the query string
+            sign_payload = f"{timestamp}{self.api_key}{recv_window}{param_str}"
         else:
+            # For POST requests, use JSON body without sorting keys (order matters!)
             param_str = json.dumps(params, separators=(',', ':'))
+            # The signature payload for POST requests includes the JSON body
+            sign_payload = f"{timestamp}{self.api_key}{recv_window}{param_str}"
         
         # Create signature
-        recv_window = "5000"
-        sign_str = f"{timestamp}{self.api_key}{recv_window}{param_str}"
         signature = hmac.new(
             self.api_secret.encode('utf-8'),
-            sign_str.encode('utf-8'),
+            sign_payload.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
         
