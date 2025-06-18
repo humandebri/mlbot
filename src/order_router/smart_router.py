@@ -526,7 +526,13 @@ class SmartRouter:
             logger.warning(f"No Redis data for {symbol}, trying API fallback")
             
             # Fallback to Bybit API if Redis data not available
-            ticker_data = await self.executor.bybit_client.get_ticker(symbol)
+            if hasattr(self.executor, 'bybit_client'):
+                ticker_data = await self.executor.bybit_client.get_ticker(symbol)
+            elif hasattr(self.executor, 'client'):
+                ticker_data = await self.executor.client.get_ticker(symbol)
+            else:
+                logger.error(f"No Bybit client found in OrderExecutor for {symbol}")
+                return None
             
             if ticker_data:
                 bid = float(ticker_data.get('bid1Price', 0))
@@ -564,76 +570,102 @@ class SmartRouter:
         """Get latest market data from Redis streams (WebSocket data)."""
         try:
             from ..common.database import get_redis_client
+            import json
             
             redis_client = await get_redis_client()
             
-            # Try to get latest kline data (most recent candlestick)
-            kline_key = f"kline:{symbol}"
-            latest_kline = await redis_client.xrevrange(kline_key, count=1)
+            # Try orderbook data first (most accurate for bid/ask)
+            latest_orderbook = await redis_client.xrevrange("market_data:orderbook", count=10)
             
-            if latest_kline:
-                # Parse the latest kline data
-                _, fields = latest_kline[0]
-                kline_data = {k.decode() if isinstance(k, bytes) else k: 
-                             v.decode() if isinstance(v, bytes) else v 
-                             for k, v in fields.items()}
+            for entry in latest_orderbook:
+                _, fields = entry
+                data_str = fields.get("data", "")
+                if isinstance(data_str, bytes):
+                    data_str = data_str.decode()
                 
-                close = float(kline_data.get("close", 0))
-                high = float(kline_data.get("high", 0))
-                low = float(kline_data.get("low", 0))
-                volume = float(kline_data.get("volume", 0))
-                
-                if close > 0:
-                    # Calculate estimated bid/ask from recent price action
-                    price_range = high - low if high > low else close * 0.001
-                    spread_estimate = max(price_range * 0.1, close * 0.0001)  # Conservative spread
-                    
-                    bid = close - (spread_estimate / 2)
-                    ask = close + (spread_estimate / 2)
-                    
-                    logger.info(f"Using WebSocket data for {symbol}: ${close:,.2f} (vol: {volume:,.0f})")
-                    
-                    return {
-                        "bid": bid,
-                        "ask": ask,
-                        "mid_price": close,
-                        "spread": spread_estimate,
-                        "last_price": close,
-                        "volume": volume,
-                        "source": "websocket_kline"
-                    }
+                try:
+                    ob_data = json.loads(data_str)
+                    if ob_data.get("symbol") == symbol:
+                        # Use pre-computed mid_price and spread if available
+                        if "mid_price" in ob_data and "spread" in ob_data:
+                            mid_price = float(ob_data["mid_price"])
+                            spread = float(ob_data["spread"])
+                            bid = mid_price - (spread / 2)
+                            ask = mid_price + (spread / 2)
+                            
+                            logger.info(f"Using WebSocket orderbook for {symbol}: ${mid_price:,.2f} (spread: ${spread:.2f})")
+                            
+                            return {
+                                "bid": bid,
+                                "ask": ask,
+                                "mid_price": mid_price,
+                                "spread": spread,
+                                "last_price": mid_price,
+                                "source": "websocket_orderbook"
+                            }
+                        
+                        # Parse bid/ask arrays if available
+                        elif "bids_top5" in ob_data and "asks_top5" in ob_data:
+                            bids = ob_data["bids_top5"]
+                            asks = ob_data["asks_top5"]
+                            
+                            if bids and asks and bids[0] and asks[0]:
+                                best_bid = float(bids[0][0])
+                                best_ask = float(asks[0][0])
+                                mid_price = (best_bid + best_ask) / 2
+                                spread = best_ask - best_bid
+                                
+                                logger.info(f"Using WebSocket orderbook arrays for {symbol}: ${mid_price:,.2f}")
+                                
+                                return {
+                                    "bid": best_bid,
+                                    "ask": best_ask,
+                                    "mid_price": mid_price,
+                                    "spread": spread,
+                                    "last_price": mid_price,
+                                    "source": "websocket_orderbook"
+                                }
+                except (json.JSONDecodeError, KeyError, ValueError) as e:
+                    continue
             
-            # Try orderbook data as secondary option
-            orderbook_key = f"orderbook:{symbol}"
-            latest_orderbook = await redis_client.xrevrange(orderbook_key, count=1)
+            # Fallback to kline data
+            latest_kline = await redis_client.xrevrange("market_data:kline", count=10)
             
-            if latest_orderbook:
-                _, fields = latest_orderbook[0]
-                ob_data = {k.decode() if isinstance(k, bytes) else k: 
-                          v.decode() if isinstance(v, bytes) else v 
-                          for k, v in fields.items()}
+            for entry in latest_kline:
+                _, fields = entry
+                data_str = fields.get("data", "")
+                if isinstance(data_str, bytes):
+                    data_str = data_str.decode()
                 
-                # Parse best bid/ask from orderbook
-                import json
-                bids = json.loads(ob_data.get("bids", "[]"))
-                asks = json.loads(ob_data.get("asks", "[]"))
-                
-                if bids and asks:
-                    best_bid = float(bids[0][0])
-                    best_ask = float(asks[0][0])
-                    mid_price = (best_bid + best_ask) / 2
-                    spread = best_ask - best_bid
-                    
-                    logger.info(f"Using WebSocket orderbook for {symbol}: ${mid_price:,.2f}")
-                    
-                    return {
-                        "bid": best_bid,
-                        "ask": best_ask,
-                        "mid_price": mid_price,
-                        "spread": spread,
-                        "last_price": mid_price,
-                        "source": "websocket_orderbook"
-                    }
+                try:
+                    kline_data = json.loads(data_str)
+                    if symbol in kline_data.get("topic", ""):
+                        close = float(kline_data.get("close", 0))
+                        high = float(kline_data.get("high", 0))
+                        low = float(kline_data.get("low", 0))
+                        volume = float(kline_data.get("volume", 0))
+                        
+                        if close > 0:
+                            # Calculate estimated bid/ask from recent price action
+                            price_range = high - low if high > low else close * 0.001
+                            spread_estimate = max(price_range * 0.1, close * 0.0001)  # Conservative spread
+                            
+                            bid = close - (spread_estimate / 2)
+                            ask = close + (spread_estimate / 2)
+                            
+                            logger.info(f"Using WebSocket kline for {symbol}: ${close:,.2f} (vol: {volume:,.0f})")
+                            
+                            return {
+                                "bid": bid,
+                                "ask": ask,
+                                "mid_price": close,
+                                "spread": spread_estimate,
+                                "last_price": close,
+                                "volume": volume,
+                                "source": "websocket_kline"
+                            }
+                except (json.JSONDecodeError, KeyError, ValueError) as e:
+                    continue
                     
         except Exception as e:
             logger.error(f"Failed to get Redis market data for {symbol}: {e}")

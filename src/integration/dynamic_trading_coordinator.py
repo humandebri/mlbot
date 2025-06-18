@@ -85,7 +85,7 @@ class DynamicTradingCoordinator:
         # Tracking
         self.signal_count = 0
         self.prediction_count = 0
-        self.last_predictions: Dict[str, Dict] = {}
+        self.last_predictions: Dict[str, List[Dict]] = {}  # Store recent predictions per symbol
         self.recent_signals: List[Dict] = []
         
         # Signal cooldown to prevent spam (reduced for testing)
@@ -487,6 +487,27 @@ class DynamicTradingCoordinator:
                 direction = "long"
             elif direction == "sell":
                 direction = "short"
+            
+            # Store prediction for reporting
+            prediction_data = {
+                "probability": prediction_value,
+                "confidence": confidence,
+                "direction": direction,
+                "expected_pnl": expected_pnl,
+                "model_version": "v3.1_improved_fixed",
+                "symbol": symbol,
+                "signal_info": signal_info,
+                "timestamp": datetime.now()
+            }
+            
+            # Store in last_predictions for symbol
+            if symbol not in self.last_predictions:
+                self.last_predictions[symbol] = []
+            self.last_predictions[symbol].append(prediction_data)
+            
+            # Keep only last 100 predictions per symbol
+            if len(self.last_predictions[symbol]) > 100:
+                self.last_predictions[symbol] = self.last_predictions[symbol][-100:]
             
             # Format prediction result
             return {
@@ -930,36 +951,32 @@ class DynamicTradingCoordinator:
         """Send periodic feature status reports to Discord."""
         while self.running:
             try:
-                await asyncio.sleep(600)  # Send report every 10 minutes
+                await asyncio.sleep(3600)  # Send report every hour
                 
-                feature_status = await self._get_feature_status()
+                # Get comprehensive feature data
+                detailed_report = await self._get_detailed_feature_report()
                 
-                # Construct Discord message
-                description = "📊 **特徴量生成状況**\n\n"
-                
-                # Add symbol-specific feature counts
-                for symbol in self.config.symbols:
-                    count = feature_status["feature_counts"].get(symbol, 0)
-                    age = feature_status["cache_ages"].get(symbol, 0)
-                    status_emoji = "✅" if count > 0 and age < 60 else "⚠️"
-                    description += f"{status_emoji} **{symbol}**: {count}個 (更新: {age:.1f}秒前)\n"
-                
-                description += f"\n🔢 **全体統計**\n"
-                description += f"• アクティブシンボル: {feature_status['total_symbols']}/3\n"
-                description += f"• 平均特徴量数: {feature_status['avg_feature_count']:.0f}\n"
-                description += f"• 最大キャッシュ年齢: {feature_status['max_cache_age']:.1f}秒\n"
-                description += f"• FeatureHub稼働: {'🟢' if feature_status['running'] else '🔴'}\n"
-                
-                # Add quality metrics
-                if feature_status['quality_issues']:
-                    description += f"\n⚠️ **品質問題**\n"
-                    for issue in feature_status['quality_issues']:
-                        description += f"• {issue}\n"
-                
+                # Send main report
                 discord_notifier.send_notification(
-                    title="📈 特徴量ステータスレポート",
-                    description=description,
+                    title=f"📈 特徴量詳細レポート ({datetime.now().strftime('%H:%M')} JST)",
+                    description=detailed_report["summary"],
                     color="3498db"
+                )
+                
+                # Send individual symbol reports
+                for symbol, report in detailed_report["symbols"].items():
+                    if report["has_data"]:
+                        discord_notifier.send_notification(
+                            title=f"📊 {symbol}",
+                            description=report["description"],
+                            color="2ecc71" if report["health"] == "good" else "e74c3c"
+                        )
+                
+                # Send system statistics
+                discord_notifier.send_notification(
+                    title="📊 システム統計",
+                    description=detailed_report["system_stats"],
+                    color="9b59b6"
                 )
                 
             except Exception as e:
@@ -1035,3 +1052,211 @@ class DynamicTradingCoordinator:
                 "max_cache_age": 999,
                 "quality_issues": ["特徴量ステータス取得エラー"]
             }
+    
+    async def _get_detailed_feature_report(self) -> Dict[str, Any]:
+        """Get detailed feature report with market data and statistics."""
+        try:
+            detailed_report = {
+                "summary": "",
+                "symbols": {},
+                "system_stats": ""
+            }
+            
+            # Collect data for each symbol
+            symbol_summaries = []
+            total_predictions = 0
+            total_signals = 0
+            
+            for symbol in self.config.symbols:
+                symbol_report = await self._get_symbol_detailed_report(symbol)
+                detailed_report["symbols"][symbol] = symbol_report
+                
+                if symbol_report["has_data"]:
+                    symbol_summaries.append(f"{symbol}: ${symbol_report['current_price']:,.2f} ({symbol_report['price_change_1h']:+.2f}%)")
+                    total_predictions += symbol_report.get("predictions_1h", 0)
+                    total_signals += symbol_report.get("signals_1h", 0)
+                else:
+                    symbol_summaries.append(f"{symbol}: データなし")
+            
+            # Create summary
+            current_balance = self.account_monitor.current_balance.total_equity if self.account_monitor.current_balance else 0
+            detailed_report["summary"] = (
+                f"💰 残高: ${current_balance:.2f}\n"
+                f"📈 価格状況:\n" + "\n".join(symbol_summaries) + "\n"
+                f"🔮 予測: {total_predictions}回/時間\n"
+                f"📊 シグナル: {total_signals}回/時間"
+            )
+            
+            # System statistics
+            health_status = await self._check_services_health()
+            healthy_services = sum(1 for status in health_status.values() if status)
+            
+            detailed_report["system_stats"] = (
+                f"🟢 稼働サービス: {healthy_services}/{len(health_status)}\n"
+                f"📊 予測総数: {self.prediction_count}\n"
+                f"📈 シグナル総数: {self.signal_count}\n"
+                f"⏱️ 稼働時間: {self._get_uptime()}"
+            )
+            
+            return detailed_report
+            
+        except Exception as e:
+            logger.error("Error creating detailed feature report", exception=e)
+            return {
+                "summary": "レポート生成エラー",
+                "symbols": {},
+                "system_stats": f"エラー: {str(e)}"
+            }
+    
+    async def _get_symbol_detailed_report(self, symbol: str) -> Dict[str, Any]:
+        """Get detailed report for a specific symbol."""
+        try:
+            # Get current features
+            features = await self._get_features(symbol)
+            if not features:
+                return {
+                    "has_data": False,
+                    "health": "bad",
+                    "description": "特徴量データが利用できません"
+                }
+            
+            # Get market data from Redis (WebSocket data)
+            market_data = await self._get_redis_market_data(symbol)
+            
+            # Extract key feature values
+            current_price = features.get('close', market_data.get('last_price', 0) if market_data else 0)
+            volume = features.get('volume', 0)
+            spread = features.get('spread_bps', 0)
+            volatility = features.get('volatility_20', 0)
+            rsi = features.get('rsi_14', 50)
+            
+            # Calculate price changes
+            sma_20 = features.get('sma_20', current_price)
+            price_change_pct = ((current_price - sma_20) / sma_20 * 100) if sma_20 > 0 else 0
+            
+            # Get orderbook imbalance
+            bid_volume = features.get('bid_volume_top5', 0)
+            ask_volume = features.get('ask_volume_top5', 0)
+            total_ob_volume = bid_volume + ask_volume
+            orderbook_imbalance = ((bid_volume - ask_volume) / total_ob_volume * 100) if total_ob_volume > 0 else 0
+            
+            # Get liquidation data
+            liquidation_buy = features.get('liquidation_buy_volume_5m', 0)
+            liquidation_sell = features.get('liquidation_sell_volume_5m', 0)
+            
+            # Count recent predictions and signals for this symbol
+            predictions_1h = sum(1 for p in self.last_predictions.get(symbol, []) 
+                               if (datetime.now() - p.get('timestamp', datetime.min)).seconds < 3600)
+            signals_1h = sum(1 for s in self.recent_signals 
+                           if s.get('symbol') == symbol and 
+                           (datetime.now() - s.get('timestamp', datetime.min)).seconds < 3600)
+            
+            # Determine health status
+            health = "good"
+            if current_price == 0 or volume == 0:
+                health = "bad"
+            elif volatility > 0.03 or spread > 50:
+                health = "warning"
+            
+            # Create detailed description
+            description = (
+                f"💵 価格: ${current_price:,.2f}\n"
+                f"📊 出来高: {volume:,.0f} ({features.get('volume_ratio', 1):.1f}x平均)\n"
+                f"📈 RSI: {rsi:.1f}\n"
+                f"🌊 ボラティリティ: {volatility*100:.2f}%\n"
+                f"💱 スプレッド: {spread:.1f} bps\n"
+                f"📚 オーダーブック: {orderbook_imbalance:+.1f}% {'買い優勢' if orderbook_imbalance > 0 else '売り優勢'}\n"
+                f"💥 清算 (5分): 買い ${liquidation_buy:,.0f} / 売り ${liquidation_sell:,.0f}\n"
+                f"🔮 予測/時間: {predictions_1h}回\n"
+                f"📊 シグナル/時間: {signals_1h}回"
+            )
+            
+            # Add latest prediction info if available
+            if symbol in self.last_predictions:
+                latest = self.last_predictions[symbol][-1] if self.last_predictions[symbol] else None
+                if latest:
+                    confidence = latest.get('confidence', 0)
+                    direction = latest.get('direction', 'hold')
+                    description += f"\n🎯 最新予測: {direction.upper()} (信頼度 {confidence:.1%})"
+            
+            return {
+                "has_data": True,
+                "health": health,
+                "description": description,
+                "current_price": current_price,
+                "price_change_1h": price_change_pct,
+                "predictions_1h": predictions_1h,
+                "signals_1h": signals_1h
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting detailed report for {symbol}", exception=e)
+            return {
+                "has_data": False,
+                "health": "bad",
+                "description": f"エラー: {str(e)}"
+            }
+    
+    async def _get_redis_market_data(self, symbol: str) -> Optional[Dict[str, float]]:
+        """Get latest market data from Redis streams (WebSocket data)."""
+        try:
+            if not self.redis_manager:
+                return None
+                
+            # Try orderbook data first
+            latest_orderbook = await self.redis_manager.xrevrange("market_data:orderbook", count=10)
+            
+            for entry in latest_orderbook:
+                _, fields = entry
+                data_str = fields.get("data", "")
+                if isinstance(data_str, bytes):
+                    data_str = data_str.decode()
+                
+                try:
+                    ob_data = json.loads(data_str)
+                    if ob_data.get("symbol") == symbol:
+                        return {
+                            "bid": float(ob_data.get("best_bid", 0)),
+                            "ask": float(ob_data.get("best_ask", 0)),
+                            "mid_price": float(ob_data.get("mid_price", 0)),
+                            "spread": float(ob_data.get("spread", 0)),
+                            "last_price": float(ob_data.get("mid_price", 0))
+                        }
+                except:
+                    continue
+                    
+            # Fallback to kline data
+            latest_kline = await self.redis_manager.xrevrange("market_data:kline", count=10)
+            
+            for entry in latest_kline:
+                _, fields = entry
+                data_str = fields.get("data", "")
+                if isinstance(data_str, bytes):
+                    data_str = data_str.decode()
+                
+                try:
+                    kline_data = json.loads(data_str)
+                    if symbol in kline_data.get("topic", ""):
+                        close = float(kline_data.get("close", 0))
+                        return {
+                            "last_price": close,
+                            "mid_price": close
+                        }
+                except:
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Failed to get Redis market data for {symbol}: {e}")
+        
+        return None
+    
+    def _get_uptime(self) -> str:
+        """Get system uptime as formatted string."""
+        if not hasattr(self, '_start_time'):
+            self._start_time = datetime.now()
+        
+        uptime = datetime.now() - self._start_time
+        hours = int(uptime.total_seconds() // 3600)
+        minutes = int((uptime.total_seconds() % 3600) // 60)
+        
+        return f"{hours}時間{minutes}分"
