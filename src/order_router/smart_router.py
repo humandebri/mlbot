@@ -516,22 +516,150 @@ class SmartRouter:
         return risk_approved, rejection_reason, risk_metrics
     
     async def _get_market_data(self, symbol: str) -> Optional[Dict[str, float]]:
-        """Get current market data."""
+        """Get current market data from WebSocket streams via Redis."""
         try:
-            # This would typically fetch from a market data service
-            # For now, return mock data
-            return {
-                "bid": 50000.0,
-                "ask": 50010.0,
-                "mid_price": 50005.0,
-                "spread": 10.0,
-                "last_price": 50005.0
-            }
+            # First try to get data from Redis streams (WebSocket data)
+            redis_data = await self._get_redis_market_data(symbol)
+            if redis_data:
+                return redis_data
+            
+            logger.warning(f"No Redis data for {symbol}, trying API fallback")
+            
+            # Fallback to Bybit API if Redis data not available
+            ticker_data = await self.executor.bybit_client.get_ticker(symbol)
+            
+            if ticker_data:
+                bid = float(ticker_data.get('bid1Price', 0))
+                ask = float(ticker_data.get('ask1Price', 0))
+                last_price = float(ticker_data.get('lastPrice', 0))
+                
+                # Use last price as fallback if bid/ask not available
+                if bid == 0 or ask == 0:
+                    bid = last_price * 0.9995  # Approximate bid
+                    ask = last_price * 1.0005  # Approximate ask
+                
+                mid_price = (bid + ask) / 2
+                spread = ask - bid
+                
+                logger.info(f"Using API data for {symbol}: ${last_price:,.2f}")
+                
+                return {
+                    "bid": bid,
+                    "ask": ask,
+                    "mid_price": mid_price,
+                    "spread": spread,
+                    "last_price": last_price
+                }
+                
         except Exception as e:
             logger.error("Failed to get market data",
                         symbol=symbol,
                         exception=e)
-            return None
+        
+        # Last resort: return None to prevent trading with bad data
+        logger.error(f"Could not get market data for {symbol}")
+        return None
+    
+    async def _get_redis_market_data(self, symbol: str) -> Optional[Dict[str, float]]:
+        """Get latest market data from Redis streams (WebSocket data)."""
+        try:
+            from ..common.database import get_redis_client
+            
+            redis_client = await get_redis_client()
+            
+            # Try to get latest kline data (most recent candlestick)
+            kline_key = f"kline:{symbol}"
+            latest_kline = await redis_client.xrevrange(kline_key, count=1)
+            
+            if latest_kline:
+                # Parse the latest kline data
+                _, fields = latest_kline[0]
+                kline_data = {k.decode() if isinstance(k, bytes) else k: 
+                             v.decode() if isinstance(v, bytes) else v 
+                             for k, v in fields.items()}
+                
+                close = float(kline_data.get("close", 0))
+                high = float(kline_data.get("high", 0))
+                low = float(kline_data.get("low", 0))
+                volume = float(kline_data.get("volume", 0))
+                
+                if close > 0:
+                    # Calculate estimated bid/ask from recent price action
+                    price_range = high - low if high > low else close * 0.001
+                    spread_estimate = max(price_range * 0.1, close * 0.0001)  # Conservative spread
+                    
+                    bid = close - (spread_estimate / 2)
+                    ask = close + (spread_estimate / 2)
+                    
+                    logger.info(f"Using WebSocket data for {symbol}: ${close:,.2f} (vol: {volume:,.0f})")
+                    
+                    return {
+                        "bid": bid,
+                        "ask": ask,
+                        "mid_price": close,
+                        "spread": spread_estimate,
+                        "last_price": close,
+                        "volume": volume,
+                        "source": "websocket_kline"
+                    }
+            
+            # Try orderbook data as secondary option
+            orderbook_key = f"orderbook:{symbol}"
+            latest_orderbook = await redis_client.xrevrange(orderbook_key, count=1)
+            
+            if latest_orderbook:
+                _, fields = latest_orderbook[0]
+                ob_data = {k.decode() if isinstance(k, bytes) else k: 
+                          v.decode() if isinstance(v, bytes) else v 
+                          for k, v in fields.items()}
+                
+                # Parse best bid/ask from orderbook
+                import json
+                bids = json.loads(ob_data.get("bids", "[]"))
+                asks = json.loads(ob_data.get("asks", "[]"))
+                
+                if bids and asks:
+                    best_bid = float(bids[0][0])
+                    best_ask = float(asks[0][0])
+                    mid_price = (best_bid + best_ask) / 2
+                    spread = best_ask - best_bid
+                    
+                    logger.info(f"Using WebSocket orderbook for {symbol}: ${mid_price:,.2f}")
+                    
+                    return {
+                        "bid": best_bid,
+                        "ask": best_ask,
+                        "mid_price": mid_price,
+                        "spread": spread,
+                        "last_price": mid_price,
+                        "source": "websocket_orderbook"
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Failed to get Redis market data for {symbol}: {e}")
+        
+        return None
+    
+    async def _get_fallback_price(self, symbol: str) -> Optional[float]:
+        """Get fallback price if ticker fails."""
+        try:
+            # Try to get price from features or other sources
+            if hasattr(self, '_last_known_prices') and symbol in self._last_known_prices:
+                return self._last_known_prices[symbol]
+            
+            # Default fallback based on symbol (only as last resort)
+            logger.warning(f"Using hardcoded fallback price for {symbol}")
+            if symbol == "BTCUSDT":
+                return 107000.0  # Approximate current BTC price
+            elif symbol == "ETHUSDT":
+                return 2600.0    # Approximate current ETH price
+            elif symbol == "ICPUSDT":
+                return 5.4       # Approximate current ICP price
+            
+        except Exception as e:
+            logger.error(f"Fallback price failed for {symbol}: {e}")
+        
+        return None
     
     def _calculate_order_price(
         self,

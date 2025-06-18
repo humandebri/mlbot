@@ -440,138 +440,81 @@ class DynamicTradingCoordinator:
     async def _get_prediction(self, symbol: str, features: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Get prediction from integrated model service."""
         try:
-            # Import and use the ONNX inference engine directly in integrated mode
-            from ..ml_pipeline.inference_engine import InferenceEngine
+            # Use the V3.1_improved inference engine directly
+            from ..ml_pipeline.v31_improved_inference_engine import V31ImprovedInferenceEngine, V31ImprovedConfig
             
-            # Initialize inference engine if not already done
-            if not hasattr(self, '_inference_engine'):
-                # Import the proper InferenceConfig
-                from ..ml_pipeline.inference_engine import InferenceConfig
-                
-                # Create InferenceConfig with working neural network model  
-                inference_config = InferenceConfig(
-                    model_path="models/catboost_model.onnx",  # ← FastNNニューラルネットワーク由来（AUC 0.700）
-                    preprocessor_path="models/fast_nn_scaler.pkl",
-                    max_inference_time_ms=100.0,
-                    batch_size=32,
-                    enable_batching=True,
-                    cache_size=1000,
-                    providers=["CPUExecutionProvider"],
-                    session_options=None,
-                    enable_thompson_sampling=False,
-                    confidence_threshold=0.7,
-                    max_position_size=0.1,
-                    risk_adjustment=True,
-                    enable_performance_tracking=True,
-                    log_predictions=False,
-                    alert_on_slow_inference=True
+            # Initialize V3.1_improved inference engine if not already done
+            if not hasattr(self, '_v31_inference_engine'):
+                # Create V31ImprovedConfig with optimized settings
+                v31_config = V31ImprovedConfig(
+                    model_path="models/v3.1_improved/model.onnx",
+                    confidence_threshold=0.7,  # 70%以上で取引実行
+                    buy_threshold=0.55,       # 55%以上でBUY
+                    sell_threshold=0.45,      # 45%以下でSELL  
+                    high_confidence=0.75,     # 75%以上で高信頼度
+                    medium_confidence=0.6     # 60%以上で中信頼度
                 )
                 
-                self._inference_engine = InferenceEngine(inference_config)
-                # Load the model with correct path
+                self._v31_inference_engine = V31ImprovedInferenceEngine(v31_config)
+                
+                # Load the v3.1_improved model
                 try:
-                    self._inference_engine.load_model(inference_config.model_path)
-                    logger.info(f"Model loaded successfully from {inference_config.model_path}")
+                    self._v31_inference_engine.load_model()
+                    logger.info("V3.1_improved model loaded successfully (AUC 0.838)")
                 except Exception as e:
-                    logger.error(f"Failed to load model from {inference_config.model_path}: {e}")
-                    # Try alternative model path
-                    alternative_path = "models/v3.1_improved/model.onnx"
-                    try:
-                        self._inference_engine.load_model(alternative_path)
-                        logger.info(f"Model loaded successfully from alternative path {alternative_path}")
-                    except Exception as e2:
-                        logger.error(f"Failed to load model from alternative path {alternative_path}: {e2}")
-                        return None
+                    logger.error(f"Failed to load v3.1_improved model: {e}")
+                    return None
             
-            # Convert features to the format expected by the model
-            feature_array = self._prepare_features_for_model(features)
+            # Use V3.1_improved engine for prediction
+            prediction_result = self._v31_inference_engine.predict(features)
             
-            if feature_array is not None:
-                # Convert to numpy array if it's a list
-                if isinstance(feature_array, list):
-                    import numpy as np
-                    feature_array = np.array([feature_array], dtype=np.float32)
-                
-                # Get prediction
-                prediction_result = self._inference_engine.predict(feature_array)
-                
-                self.prediction_count += 1
-                increment_counter(MODEL_PREDICTIONS, symbol=symbol)
-                
-                # Extract actual values from InferenceEngine result
-                raw_predictions = prediction_result.get("raw_predictions", [0.5])
-                confidence_scores = prediction_result.get("confidence_scores", [0.0])
-                
-                # Get first prediction value
-                probability = float(raw_predictions[0]) if len(raw_predictions) > 0 else 0.5
-                confidence = float(confidence_scores[0]) if confidence_scores and len(confidence_scores) > 0 else 0.0
-                
-                # If confidence is still 0, calculate manually from probability
-                if confidence == 0.0:
-                    confidence = abs(probability - 0.5) * 2  # Distance from neutral
-                
-                # Log if model returns 0 (indicates a problem)
-                if probability == 0.0:
-                    logger.error(f"Model returned 0 for {symbol} - this indicates a model or preprocessing issue")
-                
-                # Calculate expected PnL (simple linear mapping)
-                expected_pnl = (probability - 0.5) * 0.02  # ±2% max expected return
-                
-                # Format prediction result
-                return {
-                    "probability": probability,
-                    "confidence": confidence,
-                    "direction": "long" if probability > 0.5 else "short",
-                    "expected_pnl": expected_pnl,
-                    "model_version": "v3.1_improved",
-                    "symbol": symbol,
-                    "debug_info": {
-                        "raw_prediction": probability,
-                        "calculated_confidence": confidence,
-                        "inference_result_keys": list(prediction_result.keys())
-                    }
+            self.prediction_count += 1
+            increment_counter(MODEL_PREDICTIONS, symbol=symbol)
+            
+            # Extract values from V3.1_improved result
+            prediction_value = prediction_result.get("prediction", 0.5)
+            confidence = prediction_result.get("confidence", 0.5)
+            signal_info = prediction_result.get("signal", {})
+            
+            # Calculate expected PnL based on prediction value
+            expected_pnl = (prediction_value - 0.5) * 0.02  # ±2% max expected return
+            
+            # Determine direction from signal
+            direction = signal_info.get("direction", "HOLD").lower()
+            if direction == "hold":
+                direction = "hold"
+            elif direction == "buy":
+                direction = "long"
+            elif direction == "sell":
+                direction = "short"
+            
+            # Format prediction result
+            return {
+                "probability": prediction_value,
+                "confidence": confidence,
+                "direction": direction,
+                "expected_pnl": expected_pnl,
+                "model_version": "v3.1_improved_fixed",
+                "symbol": symbol,
+                "signal_info": signal_info,
+                "debug_info": {
+                    "raw_prediction": prediction_value,
+                    "probabilities": prediction_result.get("probabilities", {}),
+                    "signal_tradeable": signal_info.get("tradeable", False),
+                    "position_size_multiplier": signal_info.get("position_size_multiplier", 0.0)
                 }
-            else:
-                logger.warning(f"Could not prepare features for prediction: {symbol}")
-                return None
+            }
                         
         except Exception as e:
             logger.error(f"Error getting prediction for {symbol}", exception=e)
             return None
     
-    def _prepare_features_for_model(self, features: Dict[str, Any]) -> Optional[List[float]]:
-        """Prepare features for model input using FeatureAdapter26."""
-        try:
-            # Import and use FeatureAdapter26 to convert features to the 26 expected by the v1.0 model
-            from ..ml_pipeline.feature_adapter_26 import FeatureAdapter26
-            
-            if not hasattr(self, 'feature_adapter'):
-                self.feature_adapter = FeatureAdapter26()
-                logger.info("Initialized FeatureAdapter26 for v1.0 model input conversion")
-            
-            # Use the adapter to extract the correct 26 features
-            feature_array = self.feature_adapter.adapt(features)
-            
-            # Log adaptation statistics for debugging
-            stats = self.feature_adapter.get_adaptation_stats(features)
-            logger.info(
-                f"Feature adaptation: {stats['match_rate']:.1%} match rate "
-                f"({stats['matched_features']}/{stats['target_features']} features)"
-            )
-            
-            if stats['match_rate'] < 0.5:
-                # Log which features are missing vs available for debugging
-                available_features = list(features.keys())[:10]  # First 10 for brevity
-                logger.warning(
-                    f"Low feature match rate. Available features sample: {available_features}"
-                )
-            
-            # Convert numpy array to list for API compatibility
-            return feature_array.tolist()
-            
-        except Exception as e:
-            logger.error(f"Error preparing features: {e}", exc_info=True)
-            return None
+    def _prepare_features_for_model(self, features: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        V3.1_improved engine accepts feature dictionaries directly.
+        No preprocessing needed as FeatureAdapter44 is handled internally.
+        """
+        return features
     
     async def _process_prediction(self, symbol: str, prediction: Dict[str, Any], features: Dict[str, Any]) -> None:
         """Process prediction and potentially generate trading signal."""
