@@ -1477,3 +1477,28 @@ EC2インスタンス情報：
   
   - **Phase 1完了**: ローカルでの基本機能修復完了
   - **次ステップ**: Phase 2（EC2への修正デプロイ）実施予定
+
+- **MLモデル予測失敗の根本的解決**
+  - **問題**: v3.1_improvedモデルが常に0を返す（confidence=0.0, expected_pnl=0.0）
+  - **原因**: モデルは44個の技術的指標を期待するが、システムは186個のマイクロストラクチャ特徴量を生成
+  
+  - **実装した解決策**:
+    1. **TechnicalIndicatorEngine作成**（src/feature_hub/technical_indicators.py）
+       - 44個の技術的指標を正確に計算（RSI、MACD、ボリンジャーバンド等）
+       - 価格履歴管理（最大100期間）
+       - 時間特徴量の動的計算
+    
+    2. **FeatureHub修正**（src/feature_hub/main.py）
+       - TechnicalIndicatorEngineの統合
+       - klineデータから技術的指標を生成
+    
+    3. **DynamicTradingCoordinator修正**（src/integration/dynamic_trading_coordinator.py）
+       - FeatureAdapter44を使用した特徴量準備
+       - 応急処置のランダムシグナル削除
+    
+  - **テスト結果**:
+    - ✅ 44個全ての技術的指標生成成功
+    - ✅ FeatureAdapter44のマッチ率100%
+    - ✅ 非ゼロ値の生成確認
+  
+  - **デプロイ方法**: `./deploy_technical_fix.sh`

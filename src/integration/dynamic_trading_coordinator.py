@@ -88,14 +88,18 @@ class DynamicTradingCoordinator:
         self.last_predictions: Dict[str, Dict] = {}
         self.recent_signals: List[Dict] = []
         
-        # Signal cooldown to prevent spam
+        # Signal cooldown to prevent spam (reduced for testing)
         self.last_signal_time = {}
-        self.signal_cooldown = 300  # 5 minutes
+        self.signal_cooldown = 60  # 1 minute (reasonable for testing)
         
         logger.info("Dynamic Trading Coordinator initialized")
     
     def _create_dynamic_risk_config(self, account_balance: float) -> RiskConfig:
         """Create risk configuration based on account balance."""
+        # Update risk manager with current balance
+        if self.order_router and self.order_router.risk_manager:
+            self.order_router.risk_manager.update_equity(account_balance)
+            
         return RiskConfig(
             # Position limits (% of account)
             max_position_size_usd=account_balance * self.config.max_position_pct,
@@ -314,15 +318,15 @@ class DynamicTradingCoordinator:
                 for symbol in self.active_symbols:
                     features = await self._get_features(symbol)
                     if features:
-                        logger.debug(f"Features retrieved for {symbol}: {len(features)} features")
+                        logger.info(f"✅ Features retrieved for {symbol}: {len(features)} features")
                         prediction = await self._get_prediction(symbol, features)
                         if prediction:
-                            logger.info(f"Prediction generated for {symbol}: {prediction}")
+                            logger.info(f"✅ Prediction generated for {symbol}: confidence={prediction.get('confidence', 0):.2%}, expected_pnl={prediction.get('expected_pnl', 0):.4f}")
                             await self._process_prediction(symbol, prediction, features)
                         else:
-                            logger.debug(f"No prediction generated for {symbol}")
+                            logger.warning(f"❌ No prediction generated for {symbol}")
                     else:
-                        logger.debug(f"No features available for {symbol}")
+                        logger.warning(f"❌ No features available for {symbol}")
                 
                 await asyncio.sleep(self.config.prediction_interval_seconds)
                 
@@ -348,7 +352,57 @@ class DynamicTradingCoordinator:
                 logger.error("Error in health monitor", exception=e)
     
     async def _get_features(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get features for a symbol from FeatureHub."""
+        """Get features for a symbol and supplement with technical indicators."""
+        try:
+            # Get base features from FeatureHub (Redis streams)
+            base_features = await self._get_base_features(symbol)
+            
+            # If we have base features, extract price data and calculate technical indicators
+            if base_features:
+                # Initialize technical indicator engine if needed
+                if not hasattr(self, '_tech_engine'):
+                    from ..feature_hub.technical_indicators import TechnicalIndicatorEngine
+                    self._tech_engine = TechnicalIndicatorEngine(lookback_periods=100)
+                    logger.info("Technical indicator engine initialized")
+                
+                # Extract price data from base features
+                try:
+                    open_price = base_features.get('open', base_features.get('close', 50000))
+                    high = base_features.get('high', open_price)
+                    low = base_features.get('low', open_price)
+                    close = base_features.get('close', open_price)
+                    volume = base_features.get('volume', 1000000)
+                    
+                    # Calculate technical indicators
+                    tech_features = self._tech_engine.update_price_data(
+                        symbol=symbol,
+                        open_price=float(open_price),
+                        high=float(high),
+                        low=float(low),
+                        close=float(close),
+                        volume=float(volume)
+                    )
+                    
+                    # Combine base features with technical indicators
+                    combined_features = {**base_features, **tech_features}
+                    
+                    logger.debug(f"Combined features for {symbol}: {len(combined_features)} total "
+                               f"({len(base_features)} base + {len(tech_features)} technical)")
+                    
+                    return combined_features
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to calculate technical indicators for {symbol}: {e}")
+                    return base_features
+            else:
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting features for {symbol}", exception=e)
+            return None
+    
+    async def _get_base_features(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get base features from FeatureHub Redis streams."""
         try:
             # Features are stored as Redis streams, not strings
             feature_key = f"features:{symbol}:latest"
@@ -380,7 +434,7 @@ class DynamicTradingCoordinator:
                 return None
                 
         except Exception as e:
-            logger.error(f"Error getting features for {symbol}", exception=e)
+            logger.error(f"Error getting base features for {symbol}", exception=e)
             return None
     
     async def _get_prediction(self, symbol: str, features: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -394,10 +448,10 @@ class DynamicTradingCoordinator:
                 # Import the proper InferenceConfig
                 from ..ml_pipeline.inference_engine import InferenceConfig
                 
-                # Create InferenceConfig with proper settings
+                # Create InferenceConfig with working neural network model  
                 inference_config = InferenceConfig(
-                    model_path="models/v3.1_improved/model.onnx",
-                    preprocessor_path="models/v3.1_improved/scaler.pkl",
+                    model_path="models/catboost_model.onnx",  # ← FastNNニューラルネットワーク由来（AUC 0.700）
+                    preprocessor_path="models/fast_nn_scaler.pkl",
                     max_inference_time_ms=100.0,
                     batch_size=32,
                     enable_batching=True,
@@ -417,10 +471,17 @@ class DynamicTradingCoordinator:
                 # Load the model with correct path
                 try:
                     self._inference_engine.load_model(inference_config.model_path)
-                    logger.info(f"Model loading attempted for {inference_config.model_path}")
+                    logger.info(f"Model loaded successfully from {inference_config.model_path}")
                 except Exception as e:
                     logger.error(f"Failed to load model from {inference_config.model_path}: {e}")
-                    return None
+                    # Try alternative model path
+                    alternative_path = "models/v3.1_improved/model.onnx"
+                    try:
+                        self._inference_engine.load_model(alternative_path)
+                        logger.info(f"Model loaded successfully from alternative path {alternative_path}")
+                    except Exception as e2:
+                        logger.error(f"Failed to load model from alternative path {alternative_path}: {e2}")
+                        return None
             
             # Convert features to the format expected by the model
             feature_array = self._prepare_features_for_model(features)
@@ -437,14 +498,38 @@ class DynamicTradingCoordinator:
                 self.prediction_count += 1
                 increment_counter(MODEL_PREDICTIONS, symbol=symbol)
                 
+                # Extract actual values from InferenceEngine result
+                raw_predictions = prediction_result.get("raw_predictions", [0.5])
+                confidence_scores = prediction_result.get("confidence_scores", [0.0])
+                
+                # Get first prediction value
+                probability = float(raw_predictions[0]) if len(raw_predictions) > 0 else 0.5
+                confidence = float(confidence_scores[0]) if confidence_scores and len(confidence_scores) > 0 else 0.0
+                
+                # If confidence is still 0, calculate manually from probability
+                if confidence == 0.0:
+                    confidence = abs(probability - 0.5) * 2  # Distance from neutral
+                
+                # Log if model returns 0 (indicates a problem)
+                if probability == 0.0:
+                    logger.error(f"Model returned 0 for {symbol} - this indicates a model or preprocessing issue")
+                
+                # Calculate expected PnL (simple linear mapping)
+                expected_pnl = (probability - 0.5) * 0.02  # ±2% max expected return
+                
                 # Format prediction result
                 return {
-                    "probability": float(prediction_result.get("probability", 0.5)),
-                    "confidence": float(prediction_result.get("confidence", 0.0)),
-                    "direction": "long" if prediction_result.get("probability", 0.5) > 0.5 else "short",
-                    "expected_pnl": float(prediction_result.get("expected_return", 0.0)),
+                    "probability": probability,
+                    "confidence": confidence,
+                    "direction": "long" if probability > 0.5 else "short",
+                    "expected_pnl": expected_pnl,
                     "model_version": "v3.1_improved",
-                    "symbol": symbol
+                    "symbol": symbol,
+                    "debug_info": {
+                        "raw_prediction": probability,
+                        "calculated_confidence": confidence,
+                        "inference_result_keys": list(prediction_result.keys())
+                    }
                 }
             else:
                 logger.warning(f"Could not prepare features for prediction: {symbol}")
@@ -455,38 +540,37 @@ class DynamicTradingCoordinator:
             return None
     
     def _prepare_features_for_model(self, features: Dict[str, Any]) -> Optional[List[float]]:
-        """Prepare features for model input."""
+        """Prepare features for model input using FeatureAdapter26."""
         try:
-            # Extract the 44 key features needed for the v3.1_improved model
-            feature_names = [
-                'returns_1', 'returns_5', 'returns_15', 'returns_30', 'returns_60',
-                'volatility_1h', 'volatility_4h', 'volatility_24h',
-                'volume_ratio_1h', 'volume_ratio_4h', 'volume_ratio_24h',
-                'price_ma_ratio_5', 'price_ma_ratio_20', 'price_ma_ratio_50',
-                'rsi_14', 'bb_position', 'bb_width',
-                'spread_bps', 'bid_ask_imbalance', 'order_flow_imbalance',
-                'liquidation_pressure', 'funding_rate', 'open_interest_change',
-                'hour_sin', 'hour_cos', 'day_sin', 'day_cos',
-                'close', 'volume', 'trades_count',
-                'vwap_ratio', 'price_momentum', 'volume_momentum',
-                'support_distance', 'resistance_distance',
-                'trend_strength', 'volatility_rank', 'volume_rank',
-                'price_acceleration', 'volume_acceleration',
-                'market_regime', 'liquidity_score', 'momentum_score', 'mean_reversion_score'
-            ]
+            # Import and use FeatureAdapter26 to convert features to the 26 expected by the v1.0 model
+            from ..ml_pipeline.feature_adapter_26 import FeatureAdapter26
             
-            feature_vector = []
-            for name in feature_names:
-                value = features.get(name, 0.0)
-                if isinstance(value, (int, float)):
-                    feature_vector.append(float(value))
-                else:
-                    feature_vector.append(0.0)
+            if not hasattr(self, 'feature_adapter'):
+                self.feature_adapter = FeatureAdapter26()
+                logger.info("Initialized FeatureAdapter26 for v1.0 model input conversion")
             
-            return feature_vector
+            # Use the adapter to extract the correct 26 features
+            feature_array = self.feature_adapter.adapt(features)
+            
+            # Log adaptation statistics for debugging
+            stats = self.feature_adapter.get_adaptation_stats(features)
+            logger.info(
+                f"Feature adaptation: {stats['match_rate']:.1%} match rate "
+                f"({stats['matched_features']}/{stats['target_features']} features)"
+            )
+            
+            if stats['match_rate'] < 0.5:
+                # Log which features are missing vs available for debugging
+                available_features = list(features.keys())[:10]  # First 10 for brevity
+                logger.warning(
+                    f"Low feature match rate. Available features sample: {available_features}"
+                )
+            
+            # Convert numpy array to list for API compatibility
+            return feature_array.tolist()
             
         except Exception as e:
-            logger.error(f"Error preparing features: {e}")
+            logger.error(f"Error preparing features: {e}", exc_info=True)
             return None
     
     async def _process_prediction(self, symbol: str, prediction: Dict[str, Any], features: Dict[str, Any]) -> None:
@@ -509,10 +593,15 @@ class DynamicTradingCoordinator:
             if now - last_signal < self.signal_cooldown:
                 return
             
-            # Check thresholds (temporarily lowered for testing)
-            if (confidence >= 0.0 and  # Temporarily allow any confidence
-                abs(expected_pnl) >= 0.0 and  # Temporarily allow any expected PnL
-                direction != "hold"):
+            # Check thresholds (restored to reasonable values)
+            if direction != "hold":
+                # Check confidence and expected PnL thresholds
+                if confidence < 0.6 or abs(expected_pnl) < 0.001:  # Reasonable thresholds
+                    logger.debug(
+                        f"Signal below thresholds for {symbol}: "
+                        f"confidence={confidence:.2%}, expected_pnl={expected_pnl:.4f}"
+                    )
+                    return
                 
                 logger.info(f"Signal thresholds met for {symbol}: confidence={confidence}, expected_pnl={expected_pnl}, direction={direction}")
                 

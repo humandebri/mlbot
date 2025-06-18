@@ -23,13 +23,14 @@ class BybitConfig(BaseModel):
     requests_per_second: int = 5
     requests_per_minute: int = 300
     
-    # Symbols to trade (BTCUSDT removed temporarily)
-    symbols: List[str] = ["ETHUSDT", "ICPUSDT"]
+    # Symbols to trade (updated to include BTCUSDT)
+    symbols: List[str] = ["BTCUSDT", "ETHUSDT"]
     
     # WebSocket settings
     ping_interval: int = 20
     max_reconnect_attempts: int = 10
     reconnect_delay: float = 5.0
+    connection_timeout: int = 60  # Missing field that was causing AttributeError
 
 
 class RedisConfig(BaseModel):

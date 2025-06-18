@@ -249,6 +249,15 @@ class OrderExecutor:
         if symbol_count >= self.config.max_orders_per_symbol:
             raise RuntimeError(f"Max orders per symbol ({self.config.max_orders_per_symbol}) exceeded")
         
+        # Check minimum order size (Bybit minimum is typically $10)
+        order_value = quantity * price
+        min_order_size_usd = 10.0  # Bybit minimum
+        if order_value < min_order_size_usd:
+            raise RuntimeError(
+                f"Order value ${order_value:.2f} is below minimum ${min_order_size_usd}. "
+                f"Quantity: {quantity}, Price: {price}"
+            )
+        
         # Create order
         order = Order(
             order_id=str(uuid.uuid4()),

@@ -146,7 +146,7 @@ class BybitWebSocketClient:
             try:
                 # Connect with optimized settings
                 ping_interval = self.config.bybit.ping_interval
-                connection_timeout = 60  # Use default 60 second timeout
+                connection_timeout = self.config.bybit.connection_timeout
                 
                 self.websocket = await asyncio.wait_for(
                     websockets.connect(
@@ -367,6 +367,10 @@ class BybitRESTClient:
         self.api_key = settings.bybit.api_key
         self.api_secret = settings.bybit.api_secret
         
+        # API key permissions cache
+        self._api_permissions_verified = False
+        self._api_permissions = None
+        
         # Rate limiting
         self.request_semaphore = asyncio.Semaphore(settings.bybit.requests_per_second)
         self.request_times: List[float] = []
@@ -394,6 +398,48 @@ class BybitRESTClient:
         """Async context manager exit."""
         if self.session:
             await self.session.close()
+    
+    async def verify_api_permissions(self) -> Dict[str, Any]:
+        """Verify API key permissions for trading."""
+        if self._api_permissions_verified:
+            return self._api_permissions
+        
+        try:
+            url = urljoin(self.base_url, "/v5/user/query-api")
+            headers = self._get_auth_headers("GET", "/v5/user/query-api", {})
+            
+            async with self.session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("retCode") == 0:
+                        result = data.get("result", {})
+                        permissions = {
+                            "can_trade": "Trade" in result.get("permissions", []),
+                            "can_read": "ReadOnly" in result.get("permissions", []),
+                            "can_transfer": "Transfer" in result.get("permissions", []),
+                            "rate_limit": result.get("ips", [""])[0] if result.get("ips") else None,
+                            "expires": result.get("expiredAt", ""),
+                            "permissions": result.get("permissions", [])
+                        }
+                        
+                        self._api_permissions = permissions
+                        self._api_permissions_verified = True
+                        
+                        if not permissions["can_trade"]:
+                            logger.error("API key does not have trading permissions!")
+                        else:
+                            logger.info("API key permissions verified", permissions=permissions)
+                        
+                        return permissions
+                    else:
+                        logger.error(f"API error verifying permissions: {data.get('retMsg')}")
+                else:
+                    logger.error(f"HTTP error {response.status} verifying permissions")
+        
+        except Exception as e:
+            logger.error("Error verifying API permissions", exception=e)
+        
+        return {"can_trade": False, "error": "Failed to verify permissions"}
     
     async def get_open_interest(self, symbols: List[str]) -> Dict[str, float]:
         """Get open interest data with caching."""

@@ -29,7 +29,7 @@ from ..common.monitoring import (
     MODEL_PREDICTIONS, MODEL_INFERENCE_TIME,
     increment_counter, observe_histogram
 )
-from .feature_adapter_44 import FeatureAdapter44
+from .feature_adapter_26 import FeatureAdapter26
 
 logger = get_logger(__name__)
 
@@ -38,9 +38,9 @@ logger = get_logger(__name__)
 class InferenceConfig:
     """Configuration for inference engine."""
     
-    # Model paths
-    model_path: str = "models/v3.1_improved/model.onnx"
-    preprocessor_path: str = "models/v3.1_improved/scaler.pkl"
+    # Model paths - use working regressor (26 dimensions)
+    model_path: str = "models/v1.0/model.onnx"  # Alternative working regressor
+    preprocessor_path: str = "models/v1.0/scaler.pkl"
     
     # Performance settings
     max_inference_time_ms: float = 1.0
@@ -208,12 +208,31 @@ class InferenceEngine:
             self.input_name = self.onnx_session.get_inputs()[0].name
             self.output_name = self.onnx_session.get_outputs()[0].name
             
-            # Load preprocessor if available
-            preprocessor_path = Path(model_path).parent / "preprocessor.pkl"
-            if preprocessor_path.exists():
-                import pickle
-                with open(preprocessor_path, 'rb') as f:
-                    self.preprocessor = pickle.load(f)
+            # Skip preprocessor for models without scaling (catboost, v1.0)
+            if "catboost" in model_path.lower() or "v1.0" in model_path.lower():
+                self.preprocessor = None
+                logger.info(f"Skipping preprocessor for model: {model_path}")
+            else:
+                # Load preprocessor if available for other models
+                preprocessor_path = Path(model_path).parent / "preprocessor.pkl"
+                manual_scaler_path = Path(model_path).parent / "manual_scaler.json"
+                
+                # Try manual scaler first (preferred)
+                if manual_scaler_path.exists():
+                    import json
+                    with open(manual_scaler_path, 'r') as f:
+                        scaler_data = json.load(f)
+                        self.preprocessor = {
+                            'type': 'manual',
+                            'means': np.array(scaler_data['means']),
+                            'stds': np.array(scaler_data['stds'])
+                        }
+                        logger.info("Loaded manual JSON scaler")
+                elif preprocessor_path.exists():
+                    # Fallback to pickle
+                    import pickle
+                    with open(preprocessor_path, 'rb') as f:
+                        self.preprocessor = pickle.load(f)
             
             # Warm up model with dummy data
             self._warmup_model()
@@ -271,17 +290,10 @@ class InferenceEngine:
                 feature_array = features.values.astype(np.float32)
                 feature_hash = hash(features.values.tobytes()) if use_cache else None
             elif isinstance(features, dict):
-                # Convert dict to numpy array using FeatureAdapter44
-                try:
-                    from .feature_adapter_44 import FeatureAdapter44
-                    adapter = FeatureAdapter44()
-                    feature_array = adapter.adapt(features).astype(np.float32).reshape(1, -1)
-                    feature_hash = hash(str(sorted(features.items())).encode()) if use_cache else None
-                except ImportError:
-                    # Fallback: use sorted dict values
-                    feature_values = [features.get(key, 0.0) for key in sorted(features.keys())]
-                    feature_array = np.array(feature_values, dtype=np.float32).reshape(1, -1)
-                    feature_hash = hash(str(sorted(features.items())).encode()) if use_cache else None
+                # Convert dict to numpy array using FeatureAdapter26
+                adapter = FeatureAdapter26()
+                feature_array = adapter.adapt(features).astype(np.float32).reshape(1, -1)
+                feature_hash = hash(str(sorted(features.items())).encode()) if use_cache else None
             else:
                 feature_array = features.astype(np.float32)
                 feature_hash = hash(feature_array.tobytes()) if use_cache else None
@@ -292,10 +304,10 @@ class InferenceEngine:
                 logger.debug("Cache hit for prediction")
                 return cached_result
             
-            # Adapt features to model input dimension (44)
-            if feature_array.shape[-1] != 44:
-                # Use feature adapter to convert to 44 dimensions
-                feature_adapter = FeatureAdapter44()
+            # Adapt features to model input dimension (26)
+            if feature_array.shape[-1] != 26:
+                # Use feature adapter to convert to 26 dimensions
+                feature_adapter = FeatureAdapter26()
                 if len(feature_array.shape) == 1:
                     # Convert single feature vector
                     feature_dict = {f"feature_{i}": feature_array[i] for i in range(len(feature_array))}
@@ -310,8 +322,14 @@ class InferenceEngine:
             
             # Preprocess features if preprocessor available
             if self.preprocessor:
-                if hasattr(self.preprocessor, 'transform'):
-                    # Ensure input is float32 before scaling
+                if isinstance(self.preprocessor, dict) and self.preprocessor.get('type') == 'manual':
+                    # Use manual scaler
+                    means = self.preprocessor['means']
+                    stds = self.preprocessor['stds']
+                    feature_array = (feature_array - means) / stds
+                    feature_array = np.clip(feature_array, -5, 5).astype(np.float32)
+                elif hasattr(self.preprocessor, 'transform'):
+                    # Use sklearn-style preprocessor
                     feature_array = feature_array.astype(np.float32)
                     feature_array = self.preprocessor.transform(feature_array).astype(np.float32)
             
@@ -382,7 +400,7 @@ class InferenceEngine:
             return result
             
         except Exception as e:
-            logger.error("Prediction failed", exception=e)
+            logger.error(f"Prediction failed: {e}")
             raise
     
     def predict_batch(self, features_list: List[Union[pd.DataFrame, np.ndarray]]) -> List[Dict[str, Any]]:

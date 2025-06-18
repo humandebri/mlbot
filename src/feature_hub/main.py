@@ -139,6 +139,7 @@ class FeatureHub:
         from .liquidation_features import LiquidationFeatureEngine
         from .time_context import TimeContextEngine
         from .advanced_features import AdvancedFeatureAggregator
+        from .technical_indicators import TechnicalIndicatorEngine
         
         # Initialize engines with optimized parameters
         self.price_engine = PriceFeatureEngine()
@@ -147,6 +148,7 @@ class FeatureHub:
         self.liquidation_engine = LiquidationFeatureEngine()
         self.time_context_engine = TimeContextEngine()
         self.advanced_features_engine = AdvancedFeatureAggregator()
+        self.technical_indicator_engine = TechnicalIndicatorEngine()
         
         logger.info("Feature engines initialized successfully")
     
@@ -279,6 +281,25 @@ class FeatureHub:
         if self.volatility_engine:
             volatility_features = self.volatility_engine.process_kline(symbol, data)
             self._merge_features(symbol, volatility_features)
+        
+        # CRITICAL: Generate the 44 technical indicators that the ML model expects
+        if self.technical_indicator_engine:
+            # Extract OHLCV data
+            open_price = float(data.get("open", 0))
+            high = float(data.get("high", 0))
+            low = float(data.get("low", 0))
+            close = float(data.get("close", 0))
+            volume = float(data.get("volume", 0))
+            
+            # Calculate all 44 technical indicators
+            technical_features = self.technical_indicator_engine.update_price_data(
+                symbol, open_price, high, low, close, volume
+            )
+            
+            # Merge technical indicators into feature cache
+            self._merge_features(symbol, technical_features)
+            
+            logger.debug(f"Generated {len(technical_features)} technical indicators for {symbol}")
     
     async def _update_orderbook_features(self, symbol: str, data: Dict[str, Any]):
         """Update features based on orderbook data."""
