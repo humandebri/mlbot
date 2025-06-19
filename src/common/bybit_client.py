@@ -722,22 +722,42 @@ class BybitRESTClient:
                 order_type_map = {
                     "limit": "Limit",
                     "market": "Market",
-                    "limit_maker": "LimitMaker",
-                    "post_only": "PostOnly"
+                    "limit_maker": "Limit",  # LimitMaker is now just Limit with PostOnly
+                    "post_only": "Limit"     # PostOnly is a timeInForce option, not orderType
                 }
                 
-                params = {
-                    "category": "linear",
-                    "symbol": symbol,
-                    "side": side.capitalize(),  # Buy/Sell
-                    "orderType": order_type_map.get(order_type.lower(), order_type.capitalize()),
-                    "qty": str(qty),
-                    "reduceOnly": reduce_only
-                }
+                # Build params in specific order required by Bybit API v5
+                # Order matters for signature generation!
+                params = {}
+                params["category"] = "linear"
+                params["symbol"] = symbol
+                params["side"] = side.capitalize()  # Buy/Sell
+                params["orderType"] = order_type_map.get(order_type.lower(), order_type.capitalize())
+                params["qty"] = str(qty)
                 
-                if price and order_type.lower() == "limit":
-                    params["price"] = str(price)
+                # Add price for limit orders
+                if price and order_type.lower() in ["limit", "post_only", "limit_maker"]:
+                    # Format price to remove unnecessary decimal points
+                    if price == int(price):
+                        params["price"] = str(int(price))
+                    else:
+                        params["price"] = str(price)
                 
+                # For post_only and limit_maker orders, set timeInForce
+                if order_type.lower() in ["post_only", "limit_maker"]:
+                    params["timeInForce"] = "PostOnly"
+                
+                # Add positionIdx - 0 for one-way mode, 1 for Buy hedge, 2 for Sell hedge
+                # Try hedge mode: 1 for Buy side, 2 for Sell side
+                if side.lower() == "buy":
+                    params["positionIdx"] = 1
+                else:
+                    params["positionIdx"] = 2
+                
+                # Add optional parameters in order
+                if reduce_only:
+                    params["reduceOnly"] = reduce_only
+                    
                 if stop_loss:
                     params["stopLoss"] = str(stop_loss)
                     
@@ -745,6 +765,14 @@ class BybitRESTClient:
                     params["takeProfit"] = str(take_profit)
                 
                 headers = self._get_auth_headers("POST", "/v5/order/create", params)
+                
+                # Log for debugging
+                logger.info(f"Placing order: {params}")
+                
+                # Ensure session exists
+                if not self.session:
+                    self.session = aiohttp.ClientSession()
+                    logger.info("Created new aiohttp session for order placement")
                 
                 async with self.session.post(url, json=params, headers=headers) as response:
                     if response.status == 200:
@@ -754,8 +782,12 @@ class BybitRESTClient:
                             return data.get("result")
                         else:
                             logger.error(f"API error creating order: {data.get('retMsg')}")
+                            # Log the full error response for debugging
+                            logger.error(f"Full error response: {data}")
                     else:
                         logger.error(f"HTTP error {response.status} creating order")
+                        error_text = await response.text()
+                        logger.error(f"Error response: {error_text}")
                         
         except Exception as e:
             logger.error("Error creating order", exception=e)
@@ -1014,10 +1046,18 @@ class BybitRESTClient:
             # The signature payload for GET requests includes the query string
             sign_payload = f"{timestamp}{self.api_key}{recv_window}{param_str}"
         else:
-            # For POST requests, use JSON body without sorting keys (order matters!)
-            param_str = json.dumps(params, separators=(',', ':'))
+            # For POST requests, use JSON body - order is preserved in Python 3.7+
+            # IMPORTANT: Bybit expects spaces after colons in JSON!
+            param_str = json.dumps(params, separators=(', ', ': '))
             # The signature payload for POST requests includes the JSON body
             sign_payload = f"{timestamp}{self.api_key}{recv_window}{param_str}"
+            
+            # Debug logging
+            logger.debug(f"Timestamp: {timestamp}")
+            logger.debug(f"API Key: {self.api_key[:10]}...")
+            logger.debug(f"Recv Window: {recv_window}")
+            logger.debug(f"Param String: {param_str}")
+            logger.debug(f"Sign Payload: {sign_payload}")
         
         # Create signature
         signature = hmac.new(
