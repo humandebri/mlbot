@@ -367,6 +367,13 @@ class BybitRESTClient:
         self.api_key = settings.bybit.api_key
         self.api_secret = settings.bybit.api_secret
         
+        # Debug log API key status
+        logger.info(
+            f"BybitRESTClient initialized - API Key: {'Set' if self.api_key else 'Not Set'}, "
+            f"Secret: {'Set' if self.api_secret else 'Not Set'}, "
+            f"Testnet: {testnet}, Base URL: {self.base_url}"
+        )
+        
         # API key permissions cache
         self._api_permissions_verified = False
         self._api_permissions = None
@@ -658,9 +665,15 @@ class BybitRESTClient:
                         # Log response body for debugging
                         try:
                             error_body = await response.text()
-                            logger.error(f"Error response: {error_body[:200]}")
-                        except:
-                            pass
+                            logger.error(f"Error response: {error_body}")
+                            # Try to parse as JSON for more details
+                            try:
+                                error_json = json.loads(error_body)
+                                logger.error(f"Error details - retCode: {error_json.get('retCode')}, retMsg: {error_json.get('retMsg')}")
+                            except:
+                                pass
+                        except Exception as e:
+                            logger.error(f"Failed to read error response: {e}")
                         
         except aiohttp.ClientError as e:
             logger.error(f"Network error fetching positions: {e}")
@@ -1034,10 +1047,13 @@ class BybitRESTClient:
     def _get_auth_headers(self, method: str, endpoint: str, params: Dict[str, Any]) -> Dict[str, str]:
         """Generate authentication headers for Bybit API."""
         if not self.api_key or not self.api_secret:
+            logger.error(f"Missing API credentials - Key: {bool(self.api_key)}, Secret: {bool(self.api_secret)}")
             return {}
         
         timestamp = str(int(time.time() * 1000))
         recv_window = "5000"
+        
+        logger.debug(f"Generating auth headers - Method: {method}, Endpoint: {endpoint}, Timestamp: {timestamp}")
         
         # Create param string based on method
         if method == "GET":
@@ -1051,13 +1067,15 @@ class BybitRESTClient:
             param_str = json.dumps(params, separators=(', ', ': '))
             # The signature payload for POST requests includes the JSON body
             sign_payload = f"{timestamp}{self.api_key}{recv_window}{param_str}"
-            
-            # Debug logging
-            logger.debug(f"Timestamp: {timestamp}")
-            logger.debug(f"API Key: {self.api_key[:10]}...")
-            logger.debug(f"Recv Window: {recv_window}")
-            logger.debug(f"Param String: {param_str}")
-            logger.debug(f"Sign Payload: {sign_payload}")
+        
+        # Debug logging for all requests
+        logger.debug(f"Auth headers for {method} {endpoint}")
+        logger.debug(f"Timestamp: {timestamp}")
+        logger.debug(f"API Key: {self.api_key[:10] if self.api_key else 'None'}...")
+        logger.debug(f"API Secret length: {len(self.api_secret) if self.api_secret else 0}")
+        logger.debug(f"Recv Window: {recv_window}")
+        logger.debug(f"Param String: {param_str}")
+        logger.debug(f"Sign Payload: {sign_payload}")
         
         # Create signature
         signature = hmac.new(
@@ -1065,6 +1083,8 @@ class BybitRESTClient:
             sign_payload.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
+        
+        logger.debug(f"Generated signature: {signature[:20]}...")
         
         return {
             "X-BAPI-API-KEY": self.api_key,
