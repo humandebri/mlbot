@@ -1,7 +1,23 @@
-#\!/usr/bin/env python3
+#!/bin/bash
+
+echo "🚀 Deploying real-time data fix to EC2..."
+
+# EC2 details
+EC2_HOST="ubuntu@13.212.91.54"
+EC2_KEY="~/.ssh/mlbot-key-1749802416.pem"
+
+# Copy all necessary files
+echo "📤 Copying files to EC2..."
+scp -i $EC2_KEY update_duckdb_complete.py $EC2_HOST:~/mlbot/
+scp -i $EC2_KEY test_redis_ec2.py $EC2_HOST:~/mlbot/
+scp -i $EC2_KEY improved_feature_generator_redis.py $EC2_HOST:~/mlbot/
+
+# Create updated bot with Redis integration
+cat > simple_improved_bot_redis.py << 'BOTEOF'
+#!/usr/bin/env python3
 """
-Simple Improved ML Bot with Real Trading Execution - Fixed Version
-Combines improved feature generator with actual trading functionality
+Simple Improved ML Bot with Real-time Redis Integration
+Fixes static data issue by continuously updating from Redis
 """
 
 import asyncio
@@ -28,8 +44,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Import components
-from improved_feature_generator import ImprovedFeatureGenerator
+# Import the new Redis-enabled feature generator
+from improved_feature_generator_redis import ImprovedFeatureGeneratorRedis
+
+# Import other components
 from src.common.discord_notifier import discord_notifier
 from src.common.database import create_trading_tables, save_trade, save_position, get_duckdb_connection, update_position_close
 from src.common.bybit_client import BybitRESTClient
@@ -37,29 +55,29 @@ from src.common.account_monitor import AccountMonitor
 from src.ml_pipeline.inference_engine import InferenceEngine, InferenceConfig
 from src.order_router.risk_manager import RiskManager, RiskConfig
 
-class SimpleImprovedTradingBot:
-    """ML Bot with real trading execution using improved features."""
+class SimpleImprovedTradingBotRedis:
+    """ML Bot with real-time data updates from Redis."""
     
     def __init__(self):
         self.running = False
         self.tasks = []
         
-        # Initialize components
-        self.feature_generator = ImprovedFeatureGenerator()
-        self.bybit_client = BybitRESTClient(testnet=False)  # Explicitly set to mainnet
+        # Initialize components with Redis-enabled feature generator
+        self.feature_generator = ImprovedFeatureGeneratorRedis()
+        self.bybit_client = BybitRESTClient(testnet=False)
         self.account_monitor = AccountMonitor()
         self.risk_manager = RiskManager(RiskConfig())
         
         # Trading parameters
         self.symbols = ["BTCUSDT", "ETHUSDT", "ICPUSDT"]
-        self.min_confidence = 0.45  # 45% threshold - temporary fix for immediate signals
+        self.min_confidence = 0.45  # 45% threshold
         self.signal_cooldown = 300  # 5 minutes
         self.base_position_pct = 0.2  # 20% of equity per trade
-        self.min_order_size_usd = 10.0  # Bybit minimum
+        self.min_order_size_usd = 10.0
         
         # Tracking
         self.last_signal_time = {}
-        self.open_positions = {}  # Track partial closes
+        self.open_positions = {}
         self.signal_count = 0
         self.prediction_count = 0
         self.last_hourly_report = datetime.now()
@@ -74,20 +92,20 @@ class SimpleImprovedTradingBot:
             model_path=model_path,
             enable_batching=False,
             enable_thompson_sampling=False,
-            confidence_threshold=0.45,  # 45% threshold - temporary fix
+            confidence_threshold=0.45,
             risk_adjustment=False
         )
         self.inference_engine = InferenceEngine(self.inference_config)
         
     async def initialize(self):
         """Initialize all components."""
-        logger.info("Initializing Simple Improved Trading Bot...")
+        logger.info("Initializing Simple Improved Trading Bot with Redis...")
         
         try:
             # Create trading tables
             create_trading_tables()
             
-            # Initialize Bybit client using context manager
+            # Initialize Bybit client
             await self.bybit_client.__aenter__()
             
             # Initialize Account Monitor
@@ -96,11 +114,11 @@ class SimpleImprovedTradingBot:
             # Load ML model
             self.inference_engine.load_model()
             
-            # Load historical data
-            logger.info("Loading historical data...")
+            # Load initial historical data
+            logger.info("Loading initial data...")
             for symbol in self.symbols:
                 self.feature_generator.update_historical_cache(symbol)
-                logger.info(f"Loaded historical data for {symbol}")
+                logger.info(f"Loaded data for {symbol}")
             
             # Get initial balance
             await self.update_balance()
@@ -109,14 +127,14 @@ class SimpleImprovedTradingBot:
             balance_text = f"${self.current_balance:.2f}" if self.current_balance else "取得中..."
             
             discord_notifier.send_notification(
-                title="🚀 本番取引ボット起動",
-                description="改良版MLボット（実取引機能付き）が起動しました",
+                title="🚀 リアルタイム取引ボット起動",
+                description="Redis統合版MLボットが起動しました",
                 color="00ff00",
                 fields={
                     "💰 残高": balance_text,
                     "🔴 モード": "実際の資金で取引",
-                    "📊 機能": "日次レポート・部分利確・トレーリングストップ有効",
-                    "🧠 特徴量": "履歴データ使用（改良版）",
+                    "📊 機能": "リアルタイムデータ更新・Redis統合",
+                    "🧠 特徴量": "履歴データ + Redis リアルタイムデータ",
                     "⚙️ 信頼度閾値": f"{self.min_confidence * 100:.0f}%"
                 }
             )
@@ -155,19 +173,10 @@ class SimpleImprovedTradingBot:
             
             # Calculate position size
             position_size = self.current_balance * self.base_position_pct
-            position_size = min(position_size, self.current_balance * 0.3)  # Max 30% per trade
+            position_size = min(position_size, self.current_balance * 0.3)
             
             if position_size < self.min_order_size_usd:
                 logger.warning(f"Position size ${position_size:.2f} below minimum")
-                discord_notifier.send_notification(
-                    title="⚠️ 注文サイズ警告",
-                    description=f"{symbol}: ポジションサイズが最小注文サイズ未満",
-                    color="ff9900",
-                    fields={
-                        "Position Size": f"${position_size:.2f}",
-                        "Minimum": f"${self.min_order_size_usd:.2f}"
-                    }
-                )
                 return
             
             # Get current price
@@ -192,11 +201,11 @@ class SimpleImprovedTradingBot:
                 return
             
             # Calculate order parameters
-            slippage = 0.001  # 0.1%
+            slippage = 0.001
             if order_side == "buy":
                 order_price = current_price * (1 + slippage)
-                stop_loss = current_price * 0.98  # 2% stop loss
-                take_profit = current_price * 1.03  # 3% take profit
+                stop_loss = current_price * 0.98
+                take_profit = current_price * 1.03
             else:
                 order_price = current_price * (1 - slippage)
                 stop_loss = current_price * 1.02
@@ -277,11 +286,6 @@ class SimpleImprovedTradingBot:
                 
             else:
                 logger.error(f"Failed to execute order for {symbol}")
-                discord_notifier.send_notification(
-                    title="❌ 注文実行失敗",
-                    description=f"{symbol} の注文実行に失敗しました",
-                    color="ff0000"
-                )
                 
         except Exception as e:
             logger.error(f"Error executing trade for {symbol}: {e}")
@@ -298,7 +302,7 @@ class SimpleImprovedTradingBot:
         while self.running:
             try:
                 for symbol in self.symbols:
-                    # Generate features
+                    # Generate features with real-time data
                     ticker = await self.bybit_client.get_ticker(symbol)
                     if not ticker:
                         continue
@@ -344,16 +348,13 @@ class SimpleImprovedTradingBot:
                             self.signal_count += 1
                             self.last_signal_time[symbol] = now
                             
-                            # Get feature info for notification
-                            hist_data = self.feature_generator.historical_data.get(symbol)
-                            features_info = ""
-                            if hist_data is not None and len(hist_data) > 0:
-                                latest_vol = hist_data['returns'].tail(20).std() * 100
-                                latest_rsi = self.feature_generator.calculate_rsi(hist_data['close'], 14)
-                                features_info = (
-                                    f"**20-Day Volatility:** {latest_vol:.2f}%\n"
-                                    f"**RSI(14):** {latest_rsi:.1f}\n"
-                                )
+                            # Get data status
+                            combined_data = self.feature_generator.get_combined_data(symbol)
+                            data_status = "リアルタイム"
+                            if not combined_data.empty:
+                                latest_time = combined_data.index[-1]
+                                age_minutes = (datetime.now() - latest_time).total_seconds() / 60
+                                data_status = f"データ鮮度: {age_minutes:.1f}分前"
                             
                             # Send signal notification
                             discord_notifier.send_notification(
@@ -363,7 +364,7 @@ class SimpleImprovedTradingBot:
                                     f"**Confidence:** {confidence*100:.1f}%\n"
                                     f"**ML Score:** {prediction:.4f}\n"
                                     f"**Price:** ${price:,.2f}\n"
-                                    f"{features_info}"
+                                    f"**{data_status}**\n"
                                     f"**Status:** 取引実行中...\n"
                                 ),
                                 color="00ff00" if direction == "BUY" else "ff0000"
@@ -405,17 +406,8 @@ class SimpleImprovedTradingBot:
                         if size > 0:
                             pnl_pct = (unrealized_pnl / (size * entry_price)) * 100 if entry_price > 0 else 0
                             
-                            # Log position
-                            logger.info(
-                                f"Position {symbol} {side}: "
-                                f"size={size} entry=${entry_price:.2f} "
-                                f"mark=${mark_price:.2f} PnL=${unrealized_pnl:.2f} ({pnl_pct:.2f}%)"
-                            )
-                            
-                            # Check for trailing stop
+                            # Check for trailing stop and partial take profit
                             await self.check_trailing_stop(position)
-                            
-                            # Check for partial take profit
                             await self.check_partial_take_profit(position)
                             
                             # Alert if large move
@@ -426,14 +418,11 @@ class SimpleImprovedTradingBot:
                                     color="ff9900",
                                     fields={
                                         "Symbol": symbol,
-                                        "Side": side,
-                                        "Entry": f"${entry_price:.2f}",
-                                        "Current": f"${mark_price:.2f}",
                                         "PnL": f"${unrealized_pnl:.2f} ({pnl_pct:.2f}%)"
                                     }
                                 )
                 
-                await asyncio.sleep(60)  # Check every minute
+                await asyncio.sleep(60)
                 
             except Exception as e:
                 logger.error(f"Error in position monitor: {e}")
@@ -465,17 +454,6 @@ class SimpleImprovedTradingBot:
             success = await self.bybit_client.set_stop_loss(symbol, new_stop_loss)
             if success:
                 logger.info(f"Trailing stop updated for {symbol}: ${new_stop_loss:.2f}")
-                discord_notifier.send_notification(
-                    title="🔄 トレーリングストップ更新",
-                    description=f"{symbol} のストップロスを更新しました",
-                    color="03b2f8",
-                    fields={
-                        "Entry": f"${entry_price:.2f}",
-                        "Current": f"${mark_price:.2f}",
-                        "Profit": f"{profit_pct:.2f}%",
-                        "New Stop": f"${new_stop_loss:.2f}"
-                    }
-                )
     
     async def check_partial_take_profit(self, position: Dict[str, Any]):
         """Check and execute partial take profit."""
@@ -515,12 +493,7 @@ class SimpleImprovedTradingBot:
                 discord_notifier.send_notification(
                     title="💰 部分利確実行 (75%)",
                     description=f"{symbol} ポジションの25%を利確",
-                    color="00ff00",
-                    fields={
-                        "Profit": f"{profit_pct:.2f}%",
-                        "Closed": "75% total",
-                        "Remaining": "25%"
-                    }
+                    color="00ff00"
                 )
         
         # At 1.5% profit, close 50%
@@ -541,12 +514,7 @@ class SimpleImprovedTradingBot:
                 discord_notifier.send_notification(
                     title="💰 部分利確実行 (50%)",
                     description=f"{symbol} ポジションの50%を利確",
-                    color="00ff00",
-                    fields={
-                        "Profit": f"{profit_pct:.2f}%",
-                        "Closed": "50%",
-                        "Remaining": "50%"
-                    }
+                    color="00ff00"
                 )
     
     async def send_hourly_report(self):
@@ -563,9 +531,19 @@ class SimpleImprovedTradingBot:
             positions = await self.bybit_client.get_open_positions()
             total_unrealized_pnl = sum(float(p.get("unrealizedPnl", 0)) for p in positions) if positions else 0
             
+            # Get data freshness for each symbol
+            data_status = []
+            for symbol in self.symbols:
+                combined_data = self.feature_generator.get_combined_data(symbol)
+                if not combined_data.empty:
+                    latest_time = combined_data.index[-1]
+                    age_minutes = (datetime.now() - latest_time).total_seconds() / 60
+                    records = len(combined_data)
+                    data_status.append(f"{symbol}: {records}件 ({age_minutes:.1f}分前)")
+            
             # Build report
             report_lines = [
-                "**📊 時間レポート（改良版取引ボット）**",
+                "**📊 時間レポート（Redis統合版）**",
                 f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
                 "",
                 "**💰 アカウント情報:**",
@@ -573,29 +551,17 @@ class SimpleImprovedTradingBot:
                 f"• オープンポジション: {len(positions) if positions else 0}",
                 f"• 未実現損益: ${total_unrealized_pnl:.2f}",
                 "",
-                "**📈 取引統計:**",
-                f"• 予測回数: {len(recent_preds)}",
-                f"• シグナル数: {sum(1 for p in recent_preds if p['confidence'] >= self.min_confidence)}",
-                ""
+                "**📡 データステータス:**"
             ]
             
-            # Symbol statistics
-            if recent_preds:
-                for symbol in self.symbols:
-                    symbol_preds = [p for p in recent_preds if p["symbol"] == symbol]
-                    if symbol_preds:
-                        avg_pred = np.mean([p["prediction"] for p in symbol_preds])
-                        avg_conf = np.mean([p["confidence"] for p in symbol_preds]) * 100
-                        buy_count = sum(1 for p in symbol_preds if p["direction"] == "BUY")
-                        sell_count = len(symbol_preds) - buy_count
-                        latest_price = symbol_preds[-1]["price"]
-                        
-                        report_lines.append(f"**{symbol}:**")
-                        report_lines.append(f"  Price: ${latest_price:,.2f}")
-                        report_lines.append(f"  Avg Prediction: {avg_pred:.4f}")
-                        report_lines.append(f"  Avg Confidence: {avg_conf:.1f}%")
-                        report_lines.append(f"  Buy/Sell: {buy_count}/{sell_count}")
-                        report_lines.append("")
+            report_lines.extend([f"• {status}" for status in data_status])
+            
+            report_lines.extend([
+                "",
+                "**📈 取引統計:**",
+                f"• 予測回数: {len(recent_preds)}",
+                f"• シグナル数: {sum(1 for p in recent_preds if p['confidence'] >= self.min_confidence)}"
+            ])
             
             discord_notifier.send_notification(
                 title="📈 時間レポート",
@@ -605,6 +571,21 @@ class SimpleImprovedTradingBot:
             
         except Exception as e:
             logger.error(f"Error sending hourly report: {e}")
+    
+    async def periodic_data_update(self):
+        """Periodically update data from Redis."""
+        while self.running:
+            try:
+                await asyncio.sleep(60)  # Update every minute
+                
+                for symbol in self.symbols:
+                    records = self.feature_generator.update_from_redis(symbol)
+                    if records > 0:
+                        logger.info(f"Updated {symbol} with {records} new records from Redis")
+                
+            except Exception as e:
+                logger.error(f"Error in periodic data update: {e}")
+                await asyncio.sleep(60)
     
     async def daily_report_loop(self):
         """Send daily report at 9:00 AM JST."""
@@ -640,28 +621,22 @@ class SimpleImprovedTradingBot:
                 SELECT 
                     COUNT(*) as total_trades,
                     SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
-                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losing_trades,
-                    SUM(pnl) as total_pnl,
-                    AVG(pnl) as avg_pnl
+                    SUM(pnl) as total_pnl
                 FROM trades 
                 WHERE DATE(created_at) = CURRENT_DATE
             """).fetchone()
             
-            # Build daily report
-            report = {
-                "title": "📊 日次レポート (9:00 AM JST)",
-                "description": datetime.now().strftime('%Y-%m-%d'),
-                "color": "00ff00",
-                "fields": {
+            discord_notifier.send_notification(
+                title="📊 日次レポート (9:00 AM JST)",
+                description=datetime.now().strftime('%Y-%m-%d'),
+                color="00ff00",
+                fields={
                     "💰 残高": f"${self.current_balance:.2f}" if self.current_balance else "N/A",
                     "📈 本日の取引": f"{today_trades[0] if today_trades else 0}回",
                     "✅ 勝率": f"{(today_trades[1]/today_trades[0]*100) if today_trades and today_trades[0] > 0 else 0:.1f}%",
-                    "💵 本日の損益": f"${today_trades[3] if today_trades else 0:.2f}",
-                    "📊 平均損益": f"${today_trades[4] if today_trades else 0:.2f}"
+                    "💵 本日の損益": f"${today_trades[2] if today_trades else 0:.2f}"
                 }
-            }
-            
-            discord_notifier.send_notification(**report)
+            )
             
         except Exception as e:
             logger.error(f"Error sending daily report: {e}")
@@ -674,7 +649,6 @@ class SimpleImprovedTradingBot:
                 await self.update_balance()
                 
                 if self.current_balance:
-                    # Get open positions for context
                     positions = await self.bybit_client.get_open_positions()
                     open_count = len(positions) if positions else 0
                     
@@ -704,7 +678,8 @@ class SimpleImprovedTradingBot:
             asyncio.create_task(self.trading_loop()),
             asyncio.create_task(self.position_monitor_loop()),
             asyncio.create_task(self.balance_notification_loop()),
-            asyncio.create_task(self.daily_report_loop())
+            asyncio.create_task(self.daily_report_loop()),
+            asyncio.create_task(self.periodic_data_update())  # New Redis update task
         ]
         
         logger.info("All tasks started")
@@ -730,14 +705,14 @@ class SimpleImprovedTradingBot:
         
         discord_notifier.send_notification(
             title="🛑 取引ボット停止",
-            description="改良版MLボット（取引機能付き）が停止しました",
+            description="Redis統合版MLボットが停止しました",
             color="ff0000"
         )
 
 
 async def main():
     """Main entry point."""
-    bot = SimpleImprovedTradingBot()
+    bot = SimpleImprovedTradingBotRedis()
     
     # Setup signal handlers
     def signal_handler(sig):
@@ -761,5 +736,51 @@ async def main():
 
 if __name__ == "__main__":
     print("⚠️  警告: 実際の資金で取引を行います")
-    print("🔴 LIVE TRADING MODE - 改良版特徴量使用")
+    print("🔴 LIVE TRADING MODE - Redis統合版")
     asyncio.run(main())
+BOTEOF
+
+# Copy the new bot
+scp -i $EC2_KEY simple_improved_bot_redis.py $EC2_HOST:~/mlbot/
+
+# SSH and execute everything
+ssh -i $EC2_KEY $EC2_HOST << 'EOF'
+cd ~/mlbot
+
+echo "🧪 Testing Redis connectivity..."
+python3 test_redis_ec2.py
+
+echo ""
+echo "⏸️  Stopping current bot..."
+pkill -f "simple_improved_bot_with_trading_fixed.py" || true
+sleep 2
+
+echo ""
+echo "💾 Backing up database..."
+cp data/historical_data.duckdb data/historical_data.duckdb.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+
+echo ""
+echo "🔄 Updating DuckDB with latest data..."
+python3 update_duckdb_complete.py
+
+echo ""
+echo "🚀 Starting new Redis-integrated bot..."
+export DISCORD_WEBHOOK="https://discord.com/api/webhooks/1231943231416176692/t1iaVDKtm6WribhzNtYMOPjhMTpN4N9_GGr8NXprcFOjyOH_z5rnnesLqeIAdXJWy6wq"
+nohup python3 simple_improved_bot_redis.py > logs/bot_redis.log 2>&1 &
+
+sleep 5
+
+# Check if running
+if pgrep -f "simple_improved_bot_redis.py" > /dev/null; then
+    echo "✅ Bot is running with PID: $(pgrep -f simple_improved_bot_redis.py)"
+    echo ""
+    echo "📋 Recent log entries:"
+    tail -20 logs/bot_redis.log
+else
+    echo "❌ Bot failed to start! Check logs:"
+    tail -50 logs/bot_redis.log
+fi
+
+echo ""
+echo "✅ Deployment complete!"
+EOF
