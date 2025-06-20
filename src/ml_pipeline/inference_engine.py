@@ -29,7 +29,15 @@ from ..common.monitoring import (
     MODEL_PREDICTIONS, MODEL_INFERENCE_TIME,
     increment_counter, observe_histogram
 )
-from .feature_adapter_26 import FeatureAdapter26
+try:
+    from .feature_adapter_26 import FeatureAdapter26
+except ImportError:
+    # Fallback if module not found
+    class FeatureAdapter26:
+        def adapt(self, features):
+            if isinstance(features, dict):
+                return np.array(list(features.values())[:26])
+            return features[:26]
 
 logger = get_logger(__name__)
 
@@ -206,7 +214,8 @@ class InferenceEngine:
             
             # Get input/output names
             self.input_name = self.onnx_session.get_inputs()[0].name
-            self.output_name = self.onnx_session.get_outputs()[0].name
+            self.output_names = [output.name for output in self.onnx_session.get_outputs()]
+            self.output_name = self.output_names[0]  # Keep for backward compatibility
             
             # Skip preprocessor for models without scaling (catboost, v1.0)
             if "catboost" in model_path.lower() or "v1.0" in model_path.lower():
@@ -304,8 +313,8 @@ class InferenceEngine:
                 logger.debug("Cache hit for prediction")
                 return cached_result
             
-            # Adapt features to model input dimension (26)
-            if feature_array.shape[-1] != 26:
+            # Skip feature adaptation for v3.1_improved model (44 dimensions)
+            if "v3.1_improved" not in str(self.config.model_path) and feature_array.shape[-1] != 26:
                 # Use feature adapter to convert to 26 dimensions
                 feature_adapter = FeatureAdapter26()
                 if len(feature_array.shape) == 1:
@@ -333,17 +342,26 @@ class InferenceEngine:
                     feature_array = feature_array.astype(np.float32)
                     feature_array = self.preprocessor.transform(feature_array).astype(np.float32)
             
-            # Make prediction
-            prediction_raw = self.onnx_session.run(
-                [self.output_name],
+            # Make prediction - get both outputs
+            outputs = self.onnx_session.run(
+                None,  # Get all outputs
                 {self.input_name: feature_array}
-            )[0]
+            )
             
-            # Process single vs batch predictions
-            if len(prediction_raw.shape) == 1:
-                predictions = prediction_raw
+            # Extract probability values from outputs
+            # outputs[0] = class labels, outputs[1] = probabilities dict
+            if len(outputs) > 1 and isinstance(outputs[1], list):
+                # Extract probability of positive class (1) from each prediction
+                predictions = []
+                for prob_dict in outputs[1]:
+                    if isinstance(prob_dict, dict):
+                        # Get probability of class 1 (positive/buy signal)
+                        prob_positive = prob_dict.get(1, 0.5)
+                        predictions.append(prob_positive)
+                predictions = np.array(predictions, dtype=np.float32)
             else:
-                predictions = prediction_raw.flatten()
+                # Fallback to class labels if probability not available
+                predictions = outputs[0].flatten().astype(np.float32)
             
             # Calculate confidence scores
             confidence_scores = None
