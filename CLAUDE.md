@@ -145,6 +145,71 @@ MODEL__MODEL_PATH=models/v3.1_improved/model.onnx
 
 ## 変更履歴
 
+### 2025/06/21
+- **信頼度50%達成のための調査と実装**
+  - DuckDBデータギャップ発見（2025-06-19 08:31まで、6月19-21日分欠落）
+  - Redisに10,006件のリアルタイムデータ確認
+  - 古い履歴テーブル（klines_btcusdt等）に2021年からの240万件発見
+  
+- **update_duckdb_enhanced.py作成**
+  - Redisから最新データ取得してギャップ埋め
+  - 古い履歴テーブル統合機能
+  - all_klinesテーブルへの集約機能
+  
+- **extend_lookback_period.py作成**
+  - lookback期間を60日から120日に延長
+  - データ可用性チェック機能
+  - 最適化設定ファイル生成
+  
+- **confidence_improvement_plan.md作成**
+  - 信頼度向上のための実行計画書
+  - 期待される結果: 43-49% → 50-65%への改善
+
+- **自動更新機能の実装**
+  - auto_update_duckdb.py: 1時間ごとの自動DuckDB更新スクリプト
+  - improved_feature_generator_persistent.py: 30分ごとの自動永続化機能付きFeature Generator
+  - auto_update_implementation_guide.md: 実装ガイド作成
+  - 現状分析：DuckDBは手動更新必要、Botはメモリ内でのみ最新データ使用
+
+- **取引実行テストと閾値調整**
+  - 信頼度閾値を一時的に43%に下げてシグナル生成確認
+  - ICPUSDT SELLシグナル生成成功（8 ICP @ $4.98）- 2回実行
+  - Discord通知送信確認
+  - 信頼度閾値を50%に戻す（本来の設定）
+  - 現在の最高信頼度：約43%（50%未満のためシグナル生成停止）
+  - データベース保存エラー発生（opened_atカラム）但し取引は成功
+
+- **重大な問題発見と緊急修復（続き）**
+  - **2日間のデータギャップ発見**
+    - DuckDB/Redisが2025-06-19 08:31で停止していた
+    - 原因: Ingestorプロセスが停止
+    - 影響: 最新データ不足により信頼度が低下
+  
+  - **emergency_data_fix.sh作成・実行**
+    - WebSocket接続テスト（成功：BTCUSDT $103,783）
+    - 簡易Ingestor起動（PID: 787558）
+    - リアルタイムデータ取得再開
+    - Redisエントリー数: 10,269（増加中）
+  
+  - **Discordレポート問題の調査**
+    - 未実現損益が$0.00表示（実際は8 ICPポジション存在）
+    - シグナル数が0と表示
+    - 対策: API直接呼び出しでの実装を検討
+  
+  - **今後の対策**
+    - 3-6時間データ蓄積を待つ
+    - DuckDBを最新データで更新
+    - 履歴期間を120日以上に延長
+    - 期待: 信頼度50%以上を達成
+
+- **Discordレポートの予測回数修正**
+  - **問題**: 予測回数が1074で固定表示（実際は13,000回以上）
+  - **原因**: `len(recent_preds)`が過去1時間分のみカウント（最大2000件の履歴から）
+  - **修正**: `self.prediction_count`を直接使用するように変更
+  - **結果**: 正しい累計予測回数が表示されるように
+  - fix_prediction_count_report.py: 即時修正レポート送信スクリプト
+  - fix_bot_report_count.sh: ボットコード修正・再起動スクリプト
+
 ### 2025/06/20
 - **improved_feature_generator.py作成**
   - DuckDB履歴データから実際の技術指標を計算
