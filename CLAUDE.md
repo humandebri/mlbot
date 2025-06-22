@@ -210,6 +210,26 @@ MODEL__MODEL_PATH=models/v3.1_improved/model.onnx
   - fix_prediction_count_report.py: 即時修正レポート送信スクリプト
   - fix_bot_report_count.sh: ボットコード修正・再起動スクリプト
 
+### 2025/06/22
+- **モデルバイアス問題の発見と調査**
+  - **問題**: Buy/Sell比率が0/358（100% SELL）
+  - **調査結果**: 
+    - すべての予測が0.20〜0.46の範囲（0.5未満）
+    - モデル自体に強いSELLバイアスが存在
+    - 様々な入力でテストしても最大0.462
+  - **原因推定**:
+    - 訓練データの不均衡
+    - 清算データの性質（下落時の清算が多い）
+    - モデル訓練時のクラス不均衡未対処
+  - **作成ファイル**:
+    - investigate_prediction_bias.py: バイアス調査スクリプト
+    - fix_model_bias_plan.md: 修正計画書
+    - apply_bias_correction.sh: バイアス補正適用スクリプト
+  - **対策案**:
+    - 短期: 予測値に+0.15オフセット、動的補正
+    - 中期: モデル再訓練、アンサンブル手法
+    - 長期: 特徴量再設計、データ収集改善
+
 ### 2025/06/20
 - **improved_feature_generator.py作成**
   - DuckDB履歴データから実際の技術指標を計算
