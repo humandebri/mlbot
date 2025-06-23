@@ -230,6 +230,28 @@ MODEL__MODEL_PATH=models/v3.1_improved/model.onnx
     - 中期: モデル再訓練、アンサンブル手法
     - 長期: 特徴量再設計、データ収集改善
 
+- **深層学習モデル再訓練計画（v4）**
+  - **既存データの活用**:
+    - DuckDBに2-4年分の履歴データ発見（660万レコード）
+    - BTCUSDT: 241万件（2021年1月〜）
+    - ETHUSDT: 222万件（2021年3月〜）
+    - ICPUSDT: 196万件（2021年9月〜）
+  - **実装ファイル**:
+    - merge_historical_data.py: 履歴データ統合スクリプト
+    - prepare_balanced_dataset_v2.py: 4年分データでバランシング
+    - train_ensemble_model.py: アンサンブルモデル訓練
+    - execute_model_retraining.sh: 実行スクリプト
+  - **改善点**:
+    - 特徴量: 44→52次元（Buy/Sell圧力等追加）
+    - データ量: 6ヶ月→4年分（8倍）
+    - モデル: 4つのアンサンブル（LSTM, Transformer, XGBoost, NN）
+    - 損失関数: Focal Loss（クラス不均衡対策）
+    - バランシング: SMOTE + アンダーサンプリング
+  - **期待効果**:
+    - Buy/Sell比率: 0/100% → 40-60%
+    - 予測範囲: 0.20-0.46 → 0.1-0.9
+    - AUC: 0.838 → 0.85+
+
 ### 2025/06/20
 - **improved_feature_generator.py作成**
   - DuckDB履歴データから実際の技術指標を計算

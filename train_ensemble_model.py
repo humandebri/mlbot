@@ -544,7 +544,7 @@ def main():
     """メイン処理"""
     # データセット読み込み
     logger.info("Loading balanced dataset...")
-    data = np.load('data/balanced_dataset_v4.npz')
+    data = np.load('data/balanced_dataset_v4_full.npz')
     
     X_train = data['X_train']
     y_train = data['y_train']
