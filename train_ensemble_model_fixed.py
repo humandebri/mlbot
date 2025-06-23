@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-アンサンブル深層学習モデルの訓練スクリプト
+アンサンブル深層学習モデルの訓練スクリプト（修正版）
 Buy/Sellバイアスを解決するための複数モデルの組み合わせ
 """
 
@@ -12,6 +12,7 @@ from tensorflow.keras.optimizers import Adam
 import xgboost as xgb
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler
 import json
 import os
 from datetime import datetime
@@ -35,32 +36,21 @@ if gpus:
         logger.error(f"GPU configuration error: {e}")
 
 
-class FocalLoss(tf.keras.losses.Loss):
-    """クラス不均衡に強いFocal Loss"""
+class WeightedBinaryCrossentropy(tf.keras.losses.Loss):
+    """クラス重み付きバイナリ交差エントロピー"""
     
-    def __init__(self, gamma=2.0, alpha=0.25, name='focal_loss'):
+    def __init__(self, pos_weight=1.0, name='weighted_bce'):
         super().__init__(name=name)
-        self.gamma = gamma
-        self.alpha = alpha
+        self.pos_weight = pos_weight
     
     def call(self, y_true, y_pred):
+        # 安定性のためのクリッピング
         epsilon = tf.keras.backend.epsilon()
         y_pred = tf.clip_by_value(y_pred, epsilon, 1. - epsilon)
         
-        # Focal loss計算
-        p_t = tf.where(tf.equal(y_true, 1), y_pred, 1 - y_pred)
-        focal_weight = tf.pow(1 - p_t, self.gamma)
-        
-        # クラス重み付け
-        alpha_weight = tf.where(tf.equal(y_true, 1), self.alpha, 1 - self.alpha)
-        
-        # 交差エントロピー
-        ce = -tf.math.log(p_t)
-        
-        # 最終損失
-        loss = alpha_weight * focal_weight * ce
-        
-        return tf.reduce_mean(loss)
+        # 重み付きバイナリ交差エントロピー
+        bce = y_true * tf.math.log(y_pred) * self.pos_weight + (1 - y_true) * tf.math.log(1 - y_pred)
+        return -tf.reduce_mean(bce)
 
 
 class EnsembleModelTrainer:
@@ -71,15 +61,17 @@ class EnsembleModelTrainer:
         self.models = {}
         self.histories = {}
         self.predictions = {}
+        self.scaler = StandardScaler()
+        self.pos_weight = 1.0  # 後で計算
         
     def get_default_config(self) -> Dict:
         """デフォルト設定"""
         return {
-            'lstm': {
-                'units': [128, 64],
-                'dropout': 0.3,
+            'mlp': {  # LSTMをMLPに変更
+                'units': [256, 128, 64],
+                'dropout': 0.2,
                 'learning_rate': 0.001,
-                'batch_size': 512,
+                'batch_size': 128,
                 'epochs': 100
             },
             'transformer': {
@@ -88,45 +80,53 @@ class EnsembleModelTrainer:
                 'n_layers': 2,
                 'dropout': 0.2,
                 'learning_rate': 0.001,
-                'batch_size': 512,
+                'batch_size': 128,
                 'epochs': 100
             },
             'xgboost': {
                 'n_estimators': 1000,
-                'max_depth': 6,
+                'max_depth': 8,
                 'learning_rate': 0.01,
                 'subsample': 0.8,
                 'colsample_bytree': 0.8,
-                'scale_pos_weight': 1.0  # バランス調整
+                'scale_pos_weight': None  # 自動計算
             },
             'neural_net': {
                 'layers': [256, 128, 64],
-                'dropout': 0.3,
+                'dropout': 0.2,
                 'learning_rate': 0.001,
-                'batch_size': 512,
+                'batch_size': 128,
                 'epochs': 100
             },
             'ensemble': {
-                'weights': [0.3, 0.3, 0.2, 0.2],  # LSTM, Transformer, XGBoost, NN
+                'weights': [0.25, 0.25, 0.25, 0.25],  # 均等重み
                 'threshold_optimization': True
             }
         }
     
-    def build_lstm_model(self, input_shape: Tuple[int, int]) -> tf.keras.Model:
-        """LSTMモデルを構築"""
-        config = self.config['lstm']
+    def build_mlp_model(self, input_shape: Tuple[int]) -> tf.keras.Model:
+        """MLPモデルを構築（LSTMの代替）"""
+        config = self.config['mlp']
         
         model = models.Sequential([
-            # 入力を3Dに変換（batch, timesteps, features）
-            layers.Reshape((1, input_shape[0]), input_shape=(input_shape[0],)),
+            layers.Input(shape=(input_shape[0],)),
             
-            # LSTM層
-            layers.LSTM(config['units'][0], return_sequences=True, 
-                       kernel_regularizer=tf.keras.regularizers.l2(0.01)),
+            # 入力層の正規化
+            layers.BatchNormalization(),
+            
+            # 隠れ層
+            layers.Dense(config['units'][0], activation='relu',
+                       kernel_regularizer=tf.keras.regularizers.l2(0.0001)),
+            layers.BatchNormalization(),
             layers.Dropout(config['dropout']),
             
-            layers.LSTM(config['units'][1], 
-                       kernel_regularizer=tf.keras.regularizers.l2(0.01)),
+            layers.Dense(config['units'][1], activation='relu',
+                       kernel_regularizer=tf.keras.regularizers.l2(0.0001)),
+            layers.BatchNormalization(),
+            layers.Dropout(config['dropout']),
+            
+            layers.Dense(config['units'][2], activation='relu'),
+            layers.BatchNormalization(),
             layers.Dropout(config['dropout']),
             
             # 出力層
@@ -137,14 +137,14 @@ class EnsembleModelTrainer:
         
         model.compile(
             optimizer=Adam(learning_rate=config['learning_rate']),
-            loss=FocalLoss(gamma=2.0, alpha=0.25),
+            loss=WeightedBinaryCrossentropy(pos_weight=self.pos_weight),
             metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
         )
         
         return model
     
     def build_transformer_model(self, input_shape: Tuple[int]) -> tf.keras.Model:
-        """Transformerモデルを構築"""
+        """Transformerモデルを構築（修正版）"""
         config = self.config['transformer']
         
         # Multi-head attention層
@@ -158,24 +158,19 @@ class EnsembleModelTrainer:
             res = x + inputs
             
             # Feed Forward
-            x = layers.Conv1D(filters=ff_dim, kernel_size=1, activation="relu")(res)
+            x = layers.Dense(ff_dim, activation="relu")(res)
             x = layers.Dropout(dropout)(x)
-            x = layers.Conv1D(filters=inputs.shape[-1], kernel_size=1)(x)
+            x = layers.Dense(inputs.shape[-1])(x)
             x = layers.LayerNormalization(epsilon=1e-6)(x)
             return x + res
         
         # モデル構築
         inputs = layers.Input(shape=(input_shape[0],))
-        x = layers.Reshape((1, input_shape[0]))(inputs)
+        x = layers.BatchNormalization()(inputs)
+        x = layers.Reshape((1, input_shape[0]))(x)
         
-        # Positional encoding
-        positions = tf.range(start=0, limit=1, delta=1)
-        position_embedding = layers.Embedding(
-            input_dim=1, output_dim=config['d_model']
-        )(positions)
-        
+        # Linear projection
         x = layers.Dense(config['d_model'])(x)
-        x = x + position_embedding
         
         # Transformer blocks
         for _ in range(config['n_layers']):
@@ -189,7 +184,7 @@ class EnsembleModelTrainer:
         
         # 出力層
         x = layers.GlobalAveragePooling1D()(x)
-        x = layers.Dense(32, activation="relu")(x)
+        x = layers.Dense(64, activation="relu")(x)
         x = layers.Dropout(config['dropout'])(x)
         outputs = layers.Dense(1, activation="sigmoid")(x)
         
@@ -197,25 +192,26 @@ class EnsembleModelTrainer:
         
         model.compile(
             optimizer=Adam(learning_rate=config['learning_rate']),
-            loss=FocalLoss(gamma=2.0, alpha=0.25),
+            loss=WeightedBinaryCrossentropy(pos_weight=self.pos_weight),
             metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
         )
         
         return model
     
     def build_neural_net_model(self, input_shape: Tuple[int]) -> tf.keras.Model:
-        """通常のニューラルネットワークモデル"""
+        """通常のニューラルネットワークモデル（修正版）"""
         config = self.config['neural_net']
         
         model = models.Sequential()
         
         # 入力層
         model.add(layers.Input(shape=(input_shape[0],)))
+        model.add(layers.BatchNormalization())
         
         # 隠れ層
         for i, units in enumerate(config['layers']):
             model.add(layers.Dense(units, activation='relu',
-                                 kernel_regularizer=tf.keras.regularizers.l2(0.01)))
+                                 kernel_regularizer=tf.keras.regularizers.l2(0.0001)))
             model.add(layers.BatchNormalization())
             model.add(layers.Dropout(config['dropout']))
         
@@ -224,7 +220,7 @@ class EnsembleModelTrainer:
         
         model.compile(
             optimizer=Adam(learning_rate=config['learning_rate']),
-            loss=FocalLoss(gamma=2.0, alpha=0.25),
+            loss=WeightedBinaryCrossentropy(pos_weight=self.pos_weight),
             metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
         )
         
@@ -235,14 +231,20 @@ class EnsembleModelTrainer:
         class PredictionMonitor(tf.keras.callbacks.Callback):
             def __init__(self, X_val, y_val):
                 super().__init__()
-                self.X_val = X_val
-                self.y_val = y_val
+                self.X_val = X_val[:1000]  # サンプリングして高速化
+                self.y_val = y_val[:1000]
                 self.history = {'epoch': [], 'buy_ratio': [], 'val_auc': []}
             
             def on_epoch_end(self, epoch, logs=None):
                 predictions = self.model.predict(self.X_val, verbose=0)
                 buy_ratio = (predictions > 0.5).mean()
-                val_auc = roc_auc_score(self.y_val, predictions)
+                
+                if hasattr(self.y_val, 'values'):
+                    y_true = self.y_val.values
+                else:
+                    y_true = self.y_val
+                    
+                val_auc = roc_auc_score(y_true, predictions)
                 
                 self.history['epoch'].append(epoch)
                 self.history['buy_ratio'].append(buy_ratio)
@@ -252,7 +254,7 @@ class EnsembleModelTrainer:
                     logger.info(f"Epoch {epoch}: Buy ratio = {buy_ratio:.2%}, Val AUC = {val_auc:.4f}")
                 
                 # 極端な偏りを検出
-                if buy_ratio < 0.2 or buy_ratio > 0.8:
+                if buy_ratio < 0.1 or buy_ratio > 0.9:
                     logger.warning(f"⚠️  Extreme bias detected! Buy ratio: {buy_ratio:.2%}")
         
         return PredictionMonitor
@@ -262,38 +264,72 @@ class EnsembleModelTrainer:
         """すべてのモデルを訓練"""
         logger.info("Starting ensemble model training...")
         
-        # 1. LSTMモデル
-        logger.info("\n1. Training LSTM model...")
-        lstm_model = self.build_lstm_model((X_train.shape[1],))
+        # クラス重みの計算
+        self.pos_weight = float((len(y_train) - y_train.sum()) / (y_train.sum() + 1e-5))
+        logger.info(f"Calculated pos_weight: {self.pos_weight:.2f}")
         
-        monitor = self.create_prediction_monitor_callback()(X_val, y_val)
-        early_stop = callbacks.EarlyStopping(patience=15, restore_best_weights=True)
-        reduce_lr = callbacks.ReduceLROnPlateau(patience=5, factor=0.5)
+        # データの正規化
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_val_scaled = self.scaler.transform(X_val)
         
-        history_lstm = lstm_model.fit(
-            X_train, y_train,
-            validation_data=(X_val, y_val),
-            epochs=self.config['lstm']['epochs'],
-            batch_size=self.config['lstm']['batch_size'],
+        # 1. MLPモデル（LSTMの代替）
+        logger.info("\n1. Training MLP model...")
+        mlp_model = self.build_mlp_model((X_train.shape[1],))
+        
+        monitor = self.create_prediction_monitor_callback()(X_val_scaled, y_val)
+        early_stop = callbacks.EarlyStopping(
+            patience=20, 
+            restore_best_weights=True,
+            monitor='val_auc',
+            mode='max'
+        )
+        reduce_lr = callbacks.ReduceLROnPlateau(
+            patience=10, 
+            factor=0.5,
+            monitor='val_auc',
+            mode='max',
+            min_lr=1e-6
+        )
+        
+        history_mlp = mlp_model.fit(
+            X_train_scaled, y_train,
+            validation_data=(X_val_scaled, y_val),
+            epochs=self.config['mlp']['epochs'],
+            batch_size=self.config['mlp']['batch_size'],
             callbacks=[monitor, early_stop, reduce_lr],
+            class_weight={0: 1.0, 1: self.pos_weight},  # クラス重み追加
             verbose=1
         )
         
-        self.models['lstm'] = lstm_model
-        self.histories['lstm'] = history_lstm
+        self.models['mlp'] = mlp_model
+        self.histories['mlp'] = history_mlp
         
         # 2. Transformerモデル
         logger.info("\n2. Training Transformer model...")
         transformer_model = self.build_transformer_model((X_train.shape[1],))
         
-        monitor = self.create_prediction_monitor_callback()(X_val, y_val)
+        monitor = self.create_prediction_monitor_callback()(X_val_scaled, y_val)
+        early_stop = callbacks.EarlyStopping(
+            patience=20, 
+            restore_best_weights=True,
+            monitor='val_auc',
+            mode='max'
+        )
+        reduce_lr = callbacks.ReduceLROnPlateau(
+            patience=10, 
+            factor=0.5,
+            monitor='val_auc',
+            mode='max',
+            min_lr=1e-6
+        )
         
         history_transformer = transformer_model.fit(
-            X_train, y_train,
-            validation_data=(X_val, y_val),
+            X_train_scaled, y_train,
+            validation_data=(X_val_scaled, y_val),
             epochs=self.config['transformer']['epochs'],
             batch_size=self.config['transformer']['batch_size'],
             callbacks=[monitor, early_stop, reduce_lr],
+            class_weight={0: 1.0, 1: self.pos_weight},
             verbose=1
         )
         
@@ -310,16 +346,17 @@ class EnsembleModelTrainer:
             learning_rate=xgb_config['learning_rate'],
             subsample=xgb_config['subsample'],
             colsample_bytree=xgb_config['colsample_bytree'],
-            scale_pos_weight=xgb_config['scale_pos_weight'],
+            scale_pos_weight=self.pos_weight,
             use_label_encoder=False,
-            eval_metric='logloss'
+            eval_metric='auc',
+            early_stopping_rounds=50,
+            random_state=42
         )
         
-        xgb_model.set_params(early_stopping_rounds=50)
         xgb_model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            verbose=100
+            X_train_scaled, y_train,
+            eval_set=[(X_val_scaled, y_val)],
+            verbose=True
         )
         
         self.models['xgboost'] = xgb_model
@@ -328,14 +365,28 @@ class EnsembleModelTrainer:
         logger.info("\n4. Training Neural Network model...")
         nn_model = self.build_neural_net_model((X_train.shape[1],))
         
-        monitor = self.create_prediction_monitor_callback()(X_val, y_val)
+        monitor = self.create_prediction_monitor_callback()(X_val_scaled, y_val)
+        early_stop = callbacks.EarlyStopping(
+            patience=20, 
+            restore_best_weights=True,
+            monitor='val_auc',
+            mode='max'
+        )
+        reduce_lr = callbacks.ReduceLROnPlateau(
+            patience=10, 
+            factor=0.5,
+            monitor='val_auc',
+            mode='max',
+            min_lr=1e-6
+        )
         
         history_nn = nn_model.fit(
-            X_train, y_train,
-            validation_data=(X_val, y_val),
+            X_train_scaled, y_train,
+            validation_data=(X_val_scaled, y_val),
             epochs=self.config['neural_net']['epochs'],
             batch_size=self.config['neural_net']['batch_size'],
             callbacks=[monitor, early_stop, reduce_lr],
+            class_weight={0: 1.0, 1: self.pos_weight},
             verbose=1
         )
         
@@ -348,15 +399,18 @@ class EnsembleModelTrainer:
         """個別モデルの評価"""
         logger.info("\nEvaluating individual models...")
         
+        # テストデータも正規化
+        X_test_scaled = self.scaler.transform(X_test)
+        
         results = {}
         
         for name, model in self.models.items():
             if hasattr(model, 'predict_proba'):
                 # XGBoost
-                predictions = model.predict_proba(X_test)[:, 1]
+                predictions = model.predict_proba(X_test_scaled)[:, 1]
             else:
                 # Keras models
-                predictions = model.predict(X_test).flatten()
+                predictions = model.predict(X_test_scaled).flatten()
             
             # メトリクス計算
             auc = roc_auc_score(y_test, predictions)
@@ -386,34 +440,26 @@ class EnsembleModelTrainer:
         
         return results
     
-    def create_ensemble_predictions(self, X_test: np.ndarray) -> np.ndarray:
+    def create_ensemble_predictions(self, X_test: np.ndarray = None) -> np.ndarray:
         """アンサンブル予測を作成"""
         logger.info("\nCreating ensemble predictions...")
         
         # 重み付け平均
         weights = self.config['ensemble']['weights']
-        ensemble_pred = np.zeros(len(X_test))
         
-        model_names = ['lstm', 'transformer', 'xgboost', 'neural_net']
+        # 最初の予測で長さを取得
+        first_pred = next(iter(self.predictions.values()))
+        ensemble_pred = np.zeros(len(first_pred))
+        
+        model_names = ['mlp', 'transformer', 'xgboost', 'neural_net']
         
         for i, name in enumerate(model_names):
-            ensemble_pred += self.predictions[name] * weights[i]
+            if name in self.predictions:
+                ensemble_pred += self.predictions[name] * weights[i]
         
-        # 閾値最適化（オプション）
-        if self.config['ensemble']['threshold_optimization']:
-            # 各モデルの予測を標準化
-            for name in model_names:
-                pred = self.predictions[name]
-                mean, std = pred.mean(), pred.std()
-                self.predictions[f'{name}_normalized'] = (pred - mean) / (std + 1e-8)
-            
-            # 標準化後の重み付け平均
-            ensemble_normalized = np.zeros(len(X_test))
-            for i, name in enumerate(model_names):
-                ensemble_normalized += self.predictions[f'{name}_normalized'] * weights[i]
-            
-            # シグモイド変換で0-1に戻す
-            ensemble_pred = 1 / (1 + np.exp(-ensemble_normalized))
+        # 正規化（重みの合計で割る）
+        total_weight = sum(weights[i] for i, name in enumerate(model_names) if name in self.predictions)
+        ensemble_pred /= total_weight
         
         return ensemble_pred
     
@@ -450,18 +496,19 @@ class EnsembleModelTrainer:
         
         return results
     
-    def plot_results(self, save_path: str = "models/v4_ensemble/"):
+    def plot_results(self, save_path: str = "models/v4_ensemble_fixed/"):
         """結果をプロット"""
         os.makedirs(save_path, exist_ok=True)
         
         # 1. 予測分布のヒストグラム
         plt.figure(figsize=(15, 10))
         
-        for i, (name, predictions) in enumerate(self.predictions.items()):
+        plot_idx = 1
+        for name, predictions in self.predictions.items():
             if '_normalized' in name:
                 continue
                 
-            plt.subplot(2, 3, i+1)
+            plt.subplot(2, 3, plot_idx)
             plt.hist(predictions, bins=50, alpha=0.7, edgecolor='black')
             plt.axvline(0.5, color='red', linestyle='--', label='Decision boundary')
             plt.title(f'{name.upper()} Predictions')
@@ -470,10 +517,11 @@ class EnsembleModelTrainer:
             buy_ratio = (predictions > 0.5).mean()
             plt.text(0.05, 0.95, f'Buy ratio: {buy_ratio:.2%}', 
                     transform=plt.gca().transAxes, verticalalignment='top')
+            plot_idx += 1
         
         # アンサンブル予測
-        ensemble_pred = self.create_ensemble_predictions(None)  # X_testは不要
-        plt.subplot(2, 3, 6)
+        ensemble_pred = self.create_ensemble_predictions()
+        plt.subplot(2, 3, plot_idx)
         plt.hist(ensemble_pred, bins=50, alpha=0.7, edgecolor='black', color='green')
         plt.axvline(0.5, color='red', linestyle='--', label='Decision boundary')
         plt.title('ENSEMBLE Predictions')
@@ -490,17 +538,19 @@ class EnsembleModelTrainer:
         # 2. 訓練履歴（Kerasモデルのみ）
         plt.figure(figsize=(15, 5))
         
-        for i, (name, history) in enumerate(self.histories.items()):
+        plot_idx = 1
+        for name, history in self.histories.items():
             if history is None:
                 continue
                 
-            plt.subplot(1, 3, i+1)
+            plt.subplot(1, 3, plot_idx)
             plt.plot(history.history['loss'], label='Train Loss')
             plt.plot(history.history['val_loss'], label='Val Loss')
             plt.title(f'{name.upper()} Training History')
             plt.xlabel('Epoch')
             plt.ylabel('Loss')
             plt.legend()
+            plot_idx += 1
         
         plt.tight_layout()
         plt.savefig(os.path.join(save_path, 'training_history.png'))
@@ -508,12 +558,12 @@ class EnsembleModelTrainer:
         
         logger.info(f"Plots saved to {save_path}")
     
-    def save_models(self, save_path: str = "models/v4_ensemble/"):
+    def save_models(self, save_path: str = "models/v4_ensemble_fixed/"):
         """モデルを保存"""
         os.makedirs(save_path, exist_ok=True)
         
         # Kerasモデル
-        for name in ['lstm', 'transformer', 'neural_net']:
+        for name in ['mlp', 'transformer', 'neural_net']:
             if name in self.models:
                 model_path = os.path.join(save_path, f'{name}_model.h5')
                 self.models[name].save(model_path)
@@ -526,12 +576,22 @@ class EnsembleModelTrainer:
             joblib.dump(self.models['xgboost'], xgb_path)
             logger.info(f"Saved XGBoost model to {xgb_path}")
         
+        # スケーラーを保存
+        scaler_path = os.path.join(save_path, 'scaler.pkl')
+        joblib.dump(self.scaler, scaler_path)
+        logger.info(f"Saved scaler to {scaler_path}")
+        
         # 設定とメタデータ
         metadata = {
             'config': self.config,
             'created_at': datetime.now().isoformat(),
             'model_names': list(self.models.keys()),
-            'ensemble_weights': self.config['ensemble']['weights']
+            'ensemble_weights': self.config['ensemble']['weights'],
+            'pos_weight': self.pos_weight,
+            'scaler_params': {
+                'mean': self.scaler.mean_.tolist(),
+                'scale': self.scaler.scale_.tolist()
+            }
         }
         
         with open(os.path.join(save_path, 'metadata.json'), 'w') as f:
@@ -592,7 +652,7 @@ def main():
     print(f"  Buy ratio: {ensemble_results['buy_ratio']:.2%}")
     print(f"  Prediction range: [{ensemble_results['prediction_stats']['min']:.3f}, {ensemble_results['prediction_stats']['max']:.3f}]")
     
-    print("\n✅ Model training complete! Models saved to models/v4_ensemble/")
+    print("\n✅ Model training complete! Models saved to models/v4_ensemble_fixed/")
     print("="*60)
 
 
